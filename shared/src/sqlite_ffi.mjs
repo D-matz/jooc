@@ -9,7 +9,7 @@ export async function open(bits) {
     });
     const loading = globalThis.sqlite3Worker1Promiser.v2({ worker });
 
-    worker.postMessage(bits.buffer);
+    worker.postMessage(bits.rawBuffer);
     const promiser = await Promise.race([loading, failed]);
     const { dbId } = await promiser("open", { filename: "/data.sqlite" });
     return new Ok({ promiser, dbId });

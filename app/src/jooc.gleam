@@ -87,10 +87,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           case resp {
             Ok(resp) -> {
               resp
-                |> list.map(fn(r) { string.join(r, ",") })
-                |> string.join(";")
+              |> list.map(fn(r) { string.join(r, ",") })
+              |> string.join(";")
             }
-            Error(err) -> "decode error"
+            Error(_err) -> "decode error"
           }
         }
         Error(err) -> err
@@ -99,15 +99,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, effect.none())
     }
     UserTypedQuery(query) -> {
+      let parsed_user_query = case string.to_utf_codepoints(query) {
+        [] -> "none idk"
+        [first] -> short_query([first])
+        [first, second] -> short_query([first, second])
+        [first, second, ..rest] -> {
+          query_to_trigrams(first, second, rest)
+        }
+      }
       let exec = case model.database {
-        DbLoaded(db) ->
-          sqlite.query(
-            db,
-            "SELECT Name FROM track_fts WHERE track_fts MATCH '"
-              <> query
-              <> "'",
-            SqliteReturnedQuery,
-          )
+        DbLoaded(db) -> sqlite.query(db, parsed_user_query, SqliteReturnedQuery)
         _ -> effect.none()
       }
       #(model, exec)
@@ -117,10 +118,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         DbLoaded(db) ->
           sqlite.exec(
             db,
+            // "
+            // CREATE VIRTUAL TABLE track_fts USING fts5(Name);
+            // INSERT INTO track_fts(Name) SELECT Name FROM Track;
+            //   ",
             "
-            CREATE VIRTUAL TABLE track_fts USING fts5(Name);
-            INSERT INTO track_fts(Name) SELECT Name FROM Track;
-              ",
+            CREATE VIRTUAL TABLE track_search USING fts5(Name, tokenize='trigram');
+            INSERT INTO track_search(Name) SELECT Name FROM Track;
+            ",
             SqliteReturnedCreated,
           )
         _ -> effect.none()
@@ -130,10 +135,47 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   }
 }
 
+fn short_query(chars: List(UtfCodepoint)) -> String {
+  let text =
+    chars
+    |> string.from_utf_codepoints
+    |> string.replace("!", "!!")
+    |> string.replace("%", "!%")
+    |> string.replace("_", "!_")
+    |> string.replace("'", "''")
+  "SELECT Name FROM track_search
+   WHERE Name LIKE '%" <> text <> "%' ESCAPE '!'
+   LIMIT 20;"
+}
+
+type TrigramsAcc {
+  TrigramsAcc(trigrams: List(String), first: UtfCodepoint, second: UtfCodepoint)
+}
+
+fn query_to_trigrams(
+  first: UtfCodepoint,
+  second: UtfCodepoint,
+  rest: List(UtfCodepoint),
+) {
+  let starting_acc = TrigramsAcc(trigrams: [], first:, second:)
+  let trigrams =
+    list.fold(over: rest, from: starting_acc, with: fn(acc, third) {
+      let trigram =
+        string.from_utf_codepoints([acc.first, acc.second, third])
+        |> string.replace("\"", "\"\"")
+        |> string.replace("'", "''")
+      let trigrams = ["\"" <> trigram <> "\"", ..acc.trigrams]
+      TrigramsAcc(trigrams:, second: third, first: acc.second)
+    })
+  "SELECT Name FROM track_search WHERE track_search MATCH '"
+  <> string.join(trigrams.trigrams, " OR ")
+  <> "' ORDER BY rank LIMIT 10"
+}
+
 fn view(model: Model) -> Element(Msg) {
   h.main([], [
     h.text(case model.database {
-      DbLoaded(db:) -> "loaded"
+      DbLoaded(_db) -> "loaded"
       DbLoading -> "loading"
       DbError(err) -> "error " <> err
     }),
