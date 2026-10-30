@@ -4,6 +4,7 @@
 //
 
 import gleam/bit_array
+import gleam/dict
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http
 import gleam/http/request.{type Request}
@@ -169,25 +170,47 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
       #(model, effect.none())
     }
     UserClickedUpload -> {
-      echo model.access_key_id
+      // before uploading, update to newer version from packages.gleam.run if available
+      let all_by_name =
+        list.map(model.all, fn(pkg) {
+          #(pkg.name, pkg) })
+        |> dict.from_list
+      let update_pkg_metadata = fn(pkgs: List(storage.Package)) {
+        list.map(pkgs, fn(pkg) {
+          case all_by_name |> dict.get(pkg.name) {
+            Ok(found_pkg) -> found_pkg
+            Error(_) -> {
+              echo "already_read missing " <> pkg.name
+              pkg
+            }
+          }
+        })
+      }
+      let good = model.already_read.good |> update_pkg_metadata
+      let bad = model.already_read.bad |> update_pkg_metadata
+      let unsure = model.already_read.unsure |> update_pkg_metadata
+      let model = Model(..model, already_read: Judged(good:, bad:, unsure:))
+
+      // ok now upload
       #(
-      model,
-      slop.put_object_effect(
-        host: "21d22098b8563166bdc93387685252e4.r2.cloudflarestorage.com",
-        access_key_id: model.access_key_id
-          |> option.unwrap("no access key id"),
-        secret_access_key: model.secret_access_key
-          |> option.unwrap("no secret access key"),
-        bucket: "pkglist",
-        key: "already_read.json",
-        body: model.already_read
-          |> pkg_judged_to_json
-          |> json.to_string
-          |> bit_array.from_string,
-        on_built: RequestBuilt,
-        content_type: "application/json",
-      ),
-    )}
+        model,
+        slop.put_object_effect(
+          host: "21d22098b8563166bdc93387685252e4.r2.cloudflarestorage.com",
+          access_key_id: model.access_key_id
+            |> option.unwrap("no access key id"),
+          secret_access_key: model.secret_access_key
+            |> option.unwrap("no secret access key"),
+          bucket: "pkglist",
+          key: "already_read.json",
+          body: model.already_read
+            |> pkg_judged_to_json
+            |> json.to_string
+            |> bit_array.from_string,
+          on_built: RequestBuilt,
+          content_type: "application/json",
+        ),
+      )
+    }
     RequestBuilt(request) -> #(
       model,
       rsvp.send_bits(
@@ -213,14 +236,11 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
       #(model, effect.none())
     }
     UserEnteredBucketInfo(info) -> {
-      echo string.split(info, ",")
       let model = case string.split(info, ",") {
         [a, b] ->
           Model(..model, access_key_id: Some(a), secret_access_key: Some(b))
         _ -> model
       }
-      echo model.access_key_id
-      echo model.secret_access_key
       #(model, effect.none())
     }
   }
@@ -244,7 +264,13 @@ fn view(model: Model) -> Element(Message) {
         a.placeholder("Access Key ID,Secret Access Key"),
         event.on_input(UserEnteredBucketInfo),
       ]),
-      h.button([event.on_click(UserClickedUpload), a.disabled(model.secret_access_key == None)], [h.text("Upload to r2")]),
+      h.button(
+        [
+          event.on_click(UserClickedUpload),
+          a.disabled(model.secret_access_key == None),
+        ],
+        [h.text("Upload to r2")],
+      ),
       case model.upload_message {
         Some(upload_message) -> h.text(upload_message)
         None -> element.none()

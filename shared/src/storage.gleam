@@ -1,6 +1,6 @@
+import gleam/dynamic/decode
 import gleam/float
 import gleam/json
-import gleam/dynamic/decode
 import gleam/option.{type Option}
 import gleam/time/timestamp.{type Timestamp}
 
@@ -30,7 +30,15 @@ pub type Package {
 }
 
 pub fn package_to_json(package: Package) -> json.Json {
-  let Package(name:, description:, repository:, updated_at:, owners:, total_downloads:, recent_downloads:) = package
+  let Package(
+    name:,
+    description:,
+    repository:,
+    updated_at:,
+    owners:,
+    total_downloads:,
+    recent_downloads:,
+  ) = package
   json.object([
     #("name", json.string(name)),
     #("description", json.string(description)),
