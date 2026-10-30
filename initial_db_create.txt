@@ -1,0 +1,40 @@
+sqlite3 packages.db
+
+CREATE TABLE packages (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL,
+    repository TEXT,
+    updated_at INTEGER NOT NULL,
+    owners TEXT NOT NULL,
+    total_downloads INTEGER NOT NULL,
+    recent_downloads INTEGER NOT NULL,
+    source_code TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE packages_fts USING fts5(
+    name,
+    description,
+    owners,
+    source_code,
+    content='packages',
+    content_rowid='id',
+    tokenize='trigram'
+);
+
+CREATE TRIGGER packages_ai AFTER INSERT ON packages BEGIN
+    INSERT INTO packages_fts(rowid, name, description, owners, source_code)
+    VALUES (new.id, new.name, new.description, new.owners, new.source_code);
+END;
+
+CREATE TRIGGER packages_au AFTER UPDATE ON packages BEGIN
+    INSERT INTO packages_fts(
+        packages_fts, rowid, name, description, owners, source_code
+    )
+    VALUES (
+        'delete', old.id, old.name, old.description, old.owners, old.source_code
+    );
+
+    INSERT INTO packages_fts(rowid, name, description, owners, source_code)
+    VALUES (new.id, new.name, new.description, new.owners, new.source_code);
+END;

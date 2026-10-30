@@ -8,6 +8,7 @@ import gleam/dict
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http
 import gleam/http/request.{type Request}
+import gleam/http/response.{type Response}
 import gleam/int
 import gleam/json
 import gleam/list
@@ -24,6 +25,7 @@ import lustre/element/html as h
 import lustre/event
 import rsvp
 import slop
+import sqlite
 import storage
 
 // MAIN ------------------------------------------------------------------------
@@ -43,6 +45,7 @@ type Model {
     upload_message: Option(String),
     access_key_id: Option(String),
     secret_access_key: Option(String),
+    packages_db: Option(sqlite.Database),
   )
 }
 
@@ -98,6 +101,7 @@ fn init(_) -> #(Model, Effect(Message)) {
       upload_message: None,
       access_key_id: None,
       secret_access_key: None,
+      packages_db: None,
     )
   // CORS !!! :)) :<<<< -.- XDDDDD
   // idc if this is bad, just for admin page
@@ -124,8 +128,10 @@ type Message {
   UserClickedUpload
   RequestBuilt(request: Request(BitArray))
   UploadSucceeded
-  UploadFailed
+  UploadFailed(rsvp.Error(BitArray))
   UserEnteredBucketInfo(String)
+  ServerReturnedDatabase(Result(Response(BitArray), rsvp.Error(BitArray)))
+  BrowserOpenedDatabase(Result(sqlite.Database, String))
 }
 
 type Rating {
@@ -172,8 +178,7 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
     UserClickedUpload -> {
       // before uploading, update to newer version from packages.gleam.run if available
       let all_by_name =
-        list.map(model.all, fn(pkg) {
-          #(pkg.name, pkg) })
+        list.map(model.all, fn(pkg) { #(pkg.name, pkg) })
         |> dict.from_list
       let update_pkg_metadata = fn(pkgs: List(storage.Package)) {
         list.map(pkgs, fn(pkg) {
@@ -218,7 +223,7 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
         rsvp.expect_ok_response(fn(result) {
           case result {
             Ok(_) -> UploadSucceeded
-            Error(_) -> UploadFailed
+            Error(err) -> UploadFailed(err)
           }
         }),
       ),
@@ -226,10 +231,17 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
     UploadSucceeded -> {
       let now = timestamp.system_time() |> timestamp.to_rfc3339(duration.empty)
       let model =
-        Model(..model, upload_message: Some("good upload (" <> now <> ")"))
-      #(model, effect.none())
+        Model(..model, upload_message: Some("good json upload (" <> now <> ")"))
+      let assert Ok(req) =
+        request.to("https://bucket.correctarity.com/packages.db")
+      let get_db = rsvp.send_bits(
+        request.set_body(req, <<>>),
+        rsvp.expect_ok_response(ServerReturnedDatabase),
+      )
+      #(model, get_db)
     }
-    UploadFailed -> {
+    UploadFailed(err) -> {
+      echo err
       let now = timestamp.system_time() |> timestamp.to_rfc3339(duration.empty)
       let model =
         Model(..model, upload_message: Some("UPLOAD FAILED AT " <> now))
@@ -241,6 +253,40 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
           Model(..model, access_key_id: Some(a), secret_access_key: Some(b))
         _ -> model
       }
+      #(model, effect.none())
+    }
+    ServerReturnedDatabase(Error(err)) -> {
+      echo err
+      let now = timestamp.system_time() |> timestamp.to_rfc3339(duration.empty)
+      let model =
+        Model(
+          ..model,
+          upload_message: Some("DATABASE DOWNLOAD FAILED AT " <> now),
+        )
+      #(model, effect.none())
+    }
+    ServerReturnedDatabase(Ok(resp_db)) -> {
+      let open_db = sqlite.open(resp_db.body, BrowserOpenedDatabase)
+      #(model, open_db)
+    }
+    BrowserOpenedDatabase(Error(err)) -> {
+      let model =
+        Model(
+          ..model,
+          upload_message: Some(
+            "database downlaoded but failed to open: " <> err,
+          ),
+        )
+      #(model, effect.none())
+    }
+    BrowserOpenedDatabase(Ok(packages_db)) -> {
+      let model =
+        Model(
+          ..model,
+          packages_db: Some(packages_db),
+          upload_message: Some("downloaded packages db"),
+        )
+      echo model
       #(model, effect.none())
     }
   }
