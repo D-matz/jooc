@@ -5,6 +5,7 @@
 
 import gleam/bit_array
 import gleam/dict
+import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode.{type Decoder}
 import gleam/http
 import gleam/http/request.{type Request}
@@ -132,6 +133,7 @@ type Message {
   UserEnteredBucketInfo(String)
   ServerReturnedDatabase(Result(Response(BitArray), rsvp.Error(BitArray)))
   BrowserOpenedDatabase(Result(sqlite.Database, String))
+  DatabaseReturnedNames(Result(Dynamic, String))
 }
 
 type Rating {
@@ -234,10 +236,11 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
         Model(..model, upload_message: Some("good json upload (" <> now <> ")"))
       let assert Ok(req) =
         request.to("https://bucket.correctarity.com/packages.db")
-      let get_db = rsvp.send_bits(
-        request.set_body(req, <<>>),
-        rsvp.expect_ok_response(ServerReturnedDatabase),
-      )
+      let get_db =
+        rsvp.send_bits(
+          request.set_body(req, <<>>),
+          rsvp.expect_ok_response(ServerReturnedDatabase),
+        )
       #(model, get_db)
     }
     UploadFailed(err) -> {
@@ -286,9 +289,58 @@ fn update(model: Model, message: Message) -> #(Model, Effect(Message)) {
           packages_db: Some(packages_db),
           upload_message: Some("downloaded packages db"),
         )
-      echo model
-      #(model, effect.none())
+      let get_db_pkg_names =
+        sqlite.query(
+          packages_db,
+          "SELECT name FROM packages",
+          DatabaseReturnedNames,
+        )
+      #(model, get_db_pkg_names)
     }
+    DatabaseReturnedNames(db_response) ->
+      case db_response {
+        Error(err) -> {
+          let model = Model(..model, upload_message: Some(err))
+          #(model, effect.none())
+        }
+        Ok(db_pkg_rows) -> {
+          echo db_pkg_rows
+          let db_pkg_names =
+            echo decode.run(
+              db_pkg_rows,
+              decode.list(decode.at([0], decode.string)),
+            )
+          case db_pkg_names {
+            Error(err) -> {
+              echo err
+              let model =
+                Model(..model, upload_message: Some("error decoding names"))
+              #(model, effect.none())
+            }
+            Ok(db_pkg_names) -> {
+              let db_pkg_names = set.from_list(db_pkg_names)
+              echo "ok"
+              echo model.already_read.good
+              let from_json_add_to_db =
+                model.already_read.good
+                |> list.filter(fn(pkg) {
+                  db_pkg_names |> set.contains(pkg.name) == False
+                })
+                |> list.map(fn(pkg) {
+                  let get_pkg_url =
+                    "https://repo.hex.pm/tarballs/"
+                    <> pkg.name
+                    <> "-"
+                    <> pkg.latest_version
+                    <> ".tar"
+                  echo get_pkg_url
+                })
+              panic as "ok cool"
+              todo
+            }
+          }
+        }
+      }
   }
 }
 

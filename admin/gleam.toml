@@ -28,3 +28,4 @@ gleeunit = ">= 1.0.0 and < 2.0.0"
 
 [tools.lustre.html]
 scripts = [{ src = "/sqlite3-worker1-promiser.js" }]
+stylesheets = [{ href = "/dark.css" }]

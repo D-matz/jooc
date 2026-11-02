@@ -3,7 +3,7 @@ import { Ok, Error } from "./gleam.mjs";
 export async function open(bits) {
   let worker;
   try {
-    worker = new Worker("/sqlite-loader.js");
+    worker = new Worker("/static/jooc/sqlite-loader.js");
     const failed = new Promise((_, reject) => {
       worker.onerror = e => reject(e.message);
     });

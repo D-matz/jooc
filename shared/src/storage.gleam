@@ -26,6 +26,7 @@ pub type Package {
     owners: List(String),
     total_downloads: Int,
     recent_downloads: Int,
+    latest_version: String,
   )
 }
 
@@ -38,6 +39,7 @@ pub fn package_to_json(package: Package) -> json.Json {
     owners:,
     total_downloads:,
     recent_downloads:,
+    latest_version:,
   ) = package
   json.object([
     #("name", json.string(name)),
@@ -50,6 +52,7 @@ pub fn package_to_json(package: Package) -> json.Json {
     #("owners", json.array(owners, json.string)),
     #("total-downloads", json.int(total_downloads)),
     #("recent-downloads", json.int(recent_downloads)),
+    #("latest-version", json.string(latest_version)),
   ])
 }
 
@@ -64,6 +67,7 @@ pub fn package_decoder() -> decode.Decoder(Package) {
   use owners <- decode.field("owners", decode.list(decode.string))
   use total_downloads <- decode.field("total-downloads", decode.int)
   use recent_downloads <- decode.field("recent-downloads", decode.int)
+  use latest_version <- decode.field("latest-version", decode.string)
   decode.success(Package(
     name:,
     description:,
@@ -72,6 +76,7 @@ pub fn package_decoder() -> decode.Decoder(Package) {
     owners:,
     total_downloads:,
     recent_downloads:,
+    latest_version:,
   ))
 }
 
