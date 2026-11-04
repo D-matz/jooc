@@ -3,7 +3,7 @@ import { Ok, Error } from "./gleam.mjs";
 export async function open(bits) {
   let worker;
   try {
-    worker = new Worker("/static/jooc/sqlite-loader.js");
+    worker = new Worker("/sqlite-loader.js");
     const failed = new Promise((_, reject) => {
       worker.onerror = e => reject(e.message);
     });
@@ -19,13 +19,14 @@ export async function open(bits) {
   }
 }
 
-async function execute(db, sql, read) {
+async function execute(db, sql, bind, read) {
   try {
     const response = await db.promiser({
       type: "exec",
       dbId: db.dbId,
       args: {
         sql,
+        bind: bind.toArray(), // Gleam List -> JS array
         rowMode: "array",
         resultRows: read ? [] : undefined
       }
@@ -36,5 +37,5 @@ async function execute(db, sql, read) {
   }
 }
 
-export const exec = (db, sql) => execute(db, sql, false);
-export const query = (db, sql) => execute(db, sql, true);
+export const exec = (db, sql, bind) => execute(db, sql, bind, false);
+export const query = (db, sql, bind) => execute(db, sql, bind, true);

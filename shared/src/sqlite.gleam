@@ -14,17 +14,19 @@ pub fn open(
 pub fn exec(
   db: Database,
   sql: String,
+  bind: List(String),
   to_msg: fn(Result(Nil, String)) -> msg,
 ) -> Effect(msg) {
-  perform(fn() { do_exec(db, sql) }, to_msg)
+  perform(fn() { do_exec(db, sql, bind) }, to_msg)
 }
 
 pub fn query(
   db: Database,
   sql: String,
+  bind: List(String),
   to_msg: fn(Result(Dynamic, String)) -> msg,
 ) -> Effect(msg) {
-  perform(fn() { do_query(db, sql) }, to_msg)
+  perform(fn() { do_query(db, sql, bind) }, to_msg)
 }
 
 fn perform(
@@ -40,7 +42,7 @@ fn perform(
 fn do_open(bytes: BitArray) -> Promise(Result(Database, String))
 
 @external(javascript, "./sqlite_ffi.mjs", "exec")
-fn do_exec(db: Database, sql: String) -> Promise(Result(Nil, String))
+fn do_exec(db: Database, sql: String, bind: List(String)) -> Promise(Result(Nil, String))
 
 @external(javascript, "./sqlite_ffi.mjs", "query")
-fn do_query(db: Database, sql: String) -> Promise(Result(Dynamic, String))
+fn do_query(db: Database, sql: String, bind: List(String)) -> Promise(Result(Dynamic, String))

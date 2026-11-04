@@ -20,7 +20,11 @@ pub fn main() {
 }
 
 type Model {
-  Model(database: Db, query_response: Option(String))
+  Model(database: Db, trigram_snippet_response: List(SearchResult))
+}
+
+pub type SearchResult {
+  SearchResult(package: String, module: String, snippet: String)
 }
 
 type Db {
@@ -29,7 +33,7 @@ type Db {
   DbError(String)
 }
 
-const data_src = "https://raw.githubusercontent.com/lerocha/chinook-database/master/ChinookDatabase/DataSources/Chinook_Sqlite.sqlite"
+const data_src = "https://bucket.correctarity.com/packages.sqlite"
 
 fn init(_) -> #(Model, Effect(Msg)) {
   let assert Ok(req) = request.to(data_src)
@@ -37,16 +41,14 @@ fn init(_) -> #(Model, Effect(Msg)) {
     req
     |> request.set_body(<<>>)
     |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
-  #(Model(DbLoading, None), load_data)
+  #(Model(DbLoading, []), load_data)
 }
 
 type Msg {
   ServerReturnedData(Result(Response(BitArray), rsvp.Error(BitArray)))
   SqliteReturnedOpen(Result(sqlite.Database, String))
-  SqliteReturnedCreated(Result(Nil, String))
   SqliteReturnedQuery(Result(Dynamic, String))
   UserTypedQuery(String)
-  UserClickedExec
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -71,62 +73,44 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let model = Model(..model, database:)
       #(model, effect.none())
     }
-    SqliteReturnedCreated(create_result) -> {
-      let database = case create_result {
-        Ok(_) -> model.database
-        Error(err) -> DbError(err)
-      }
-      let model = Model(..model, database:)
-      #(model, effect.none())
-    }
     SqliteReturnedQuery(query_result) -> {
       let query_resp = case query_result {
         Ok(query_resp) -> {
-          let resp =
-            decode.run(query_resp, decode.list(decode.list(decode.string)))
+          let resp = decode.run(query_resp, trigram_snippet_decoder())
           case resp {
             Ok(resp) -> {
               resp
-              |> list.map(fn(r) { string.join(r, ",") })
-              |> string.join(";")
             }
-            Error(_err) -> "decode error"
+            Error(err) -> {
+              echo err
+              []
+            }
           }
         }
-        Error(err) -> err
+        Error(err) -> {
+          echo err
+          []
+        }
       }
-      let model = Model(..model, query_response: Some(query_resp))
+      let model = Model(..model, trigram_snippet_response: query_resp)
       #(model, effect.none())
     }
     UserTypedQuery(query) -> {
       let parsed_user_query = case string.to_utf_codepoints(query) {
-        [] -> "none idk"
-        [first] -> short_query([first])
-        [first, second] -> short_query([first, second])
+        [] -> todo
+        [first] -> todo
+        [first, second] -> todo
         [first, second, ..rest] -> {
           query_to_trigrams(first, second, rest)
         }
       }
       let exec = case model.database {
-        DbLoaded(db) -> sqlite.query(db, parsed_user_query, SqliteReturnedQuery)
-        _ -> effect.none()
-      }
-      #(model, exec)
-    }
-    UserClickedExec -> {
-      let exec = case model.database {
         DbLoaded(db) ->
-          sqlite.exec(
+          sqlite.query(
             db,
-            // "
-            // CREATE VIRTUAL TABLE track_fts USING fts5(Name);
-            // INSERT INTO track_fts(Name) SELECT Name FROM Track;
-            //   ",
-            "
-            CREATE VIRTUAL TABLE track_search USING fts5(Name, tokenize='trigram');
-            INSERT INTO track_search(Name) SELECT Name FROM Track;
-            ",
-            SqliteReturnedCreated,
+            parsed_user_query.0,
+            parsed_user_query.1,
+            SqliteReturnedQuery,
           )
         _ -> effect.none()
       }
@@ -152,24 +136,46 @@ type TrigramsAcc {
   TrigramsAcc(trigrams: List(String), first: UtfCodepoint, second: UtfCodepoint)
 }
 
+const search_sql =
+  "SELECT p.name AS package, m.name AS module,
+  snippet(modules_fts, -1, char(2), char(3), '...', 64) AS snippet
+FROM modules_fts f
+JOIN modules m ON m.id = f.rowid
+JOIN packages p ON p.id = m.package_id
+WHERE modules_fts MATCH ?
+ORDER BY f.rank LIMIT 10"
+
+// Returns #(sql, match), query puts match bind list
 fn query_to_trigrams(
   first: UtfCodepoint,
   second: UtfCodepoint,
   rest: List(UtfCodepoint),
-) {
+) -> #(String, List(String)) {
   let starting_acc = TrigramsAcc(trigrams: [], first:, second:)
-  let trigrams =
+  let acc =
     list.fold(over: rest, from: starting_acc, with: fn(acc, third) {
+      // FTS5 quoting: wrap in double quotes and double any inner double quote.
       let trigram =
         string.from_utf_codepoints([acc.first, acc.second, third])
         |> string.replace("\"", "\"\"")
-        |> string.replace("'", "''")
-      let trigrams = ["\"" <> trigram <> "\"", ..acc.trigrams]
-      TrigramsAcc(trigrams:, second: third, first: acc.second)
+      TrigramsAcc(
+        trigrams: ["\"" <> trigram <> "\"", ..acc.trigrams],
+        first: acc.second,
+        second: third,
+      )
     })
-  "SELECT Name FROM track_search WHERE track_search MATCH '"
-  <> string.join(trigrams.trigrams, " OR ")
-  <> "' ORDER BY rank LIMIT 10"
+  #(search_sql, [string.join(acc.trigrams, " OR ")])
+}
+
+fn trigram_snippet_decoder() {
+  decode.list(search_result_decoder())
+}
+
+fn search_result_decoder() {
+  use package <- decode.field(0, decode.string)
+  use module <- decode.field(1, decode.string)
+  use snippet <- decode.field(2, decode.string)
+  decode.success(SearchResult(package:, module:, snippet:))
 }
 
 fn view(model: Model) -> Element(Msg) {
@@ -179,11 +185,23 @@ fn view(model: Model) -> Element(Msg) {
       DbLoading -> "loading"
       DbError(err) -> "error " <> err
     }),
-    h.button([event.on_click(UserClickedExec)], [h.text("create idk")]),
     h.input([event.on_input(UserTypedQuery)]),
-    case model.query_response {
-      Some(resp) -> h.p([], [h.text(resp)])
-      None -> element.none()
-    },
+    ..list.map(model.trigram_snippet_response, fn(resp) {
+      h.p([], [
+        h.text(resp.module),
+        h.br([]),
+        element.unsafe_raw_html(
+          "",
+          "span",
+          [],
+          resp.snippet
+            |> string.replace("&", "&amp;")
+            |> string.replace("<", "&lt;")
+            |> string.replace(">", "&gt;")
+            |> string.replace("\u{2}", "<mark>")
+            |> string.replace("\u{3}", "</mark>"),
+        ),
+      ])
+    })
   ])
 }
