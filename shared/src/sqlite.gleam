@@ -42,7 +42,15 @@ fn perform(
 fn do_open(bytes: BitArray) -> Promise(Result(Database, String))
 
 @external(javascript, "./sqlite_ffi.mjs", "exec")
-fn do_exec(db: Database, sql: String, bind: List(String)) -> Promise(Result(Nil, String))
+fn do_exec(
+  db: Database,
+  sql: String,
+  bind: List(String),
+) -> Promise(Result(Nil, String))
 
 @external(javascript, "./sqlite_ffi.mjs", "query")
-fn do_query(db: Database, sql: String, bind: List(String)) -> Promise(Result(Dynamic, String))
+fn do_query(
+  db: Database,
+  sql: String,
+  bind: List(String),
+) -> Promise(Result(Dynamic, String))

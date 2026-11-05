@@ -1,9 +1,11 @@
+import edit_distance
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
 import gleam/http/request
 import gleam/http/response.{type Response}
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -15,6 +17,7 @@ import lustre/element.{type Element}
 import lustre/element/html as h
 import lustre/event
 import rsvp
+import sql
 import sqlite
 import storage
 import timeago
@@ -26,7 +29,12 @@ pub fn main() {
 }
 
 type Model {
-  Model(database: Db, search_result: List(SearchResult))
+  Model(
+    database: Db,
+    search_result: List(SearchResult),
+    lucy: Search,
+    all_pkg_names: List(String),
+  )
 }
 
 type SearchResult {
@@ -38,9 +46,19 @@ type Snippet {
 }
 
 type Db {
-  DbLoaded(db: sqlite.Database)
   DbLoading
+  DbLoaded(db: sqlite.Database, animation: Animation)
   DbError(String)
+}
+
+type Animation {
+  Finishing
+  Done
+}
+
+type Search {
+  Searching
+  NotSearching
 }
 
 const data_src = "https://bucket.correctarity.com/packages.sqlite"
@@ -51,7 +69,7 @@ fn init(_) -> #(Model, Effect(Msg)) {
     req
     |> request.set_body(<<>>)
     |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
-  #(Model(DbLoading, []), load_data)
+  #(Model(DbLoading, [], NotSearching, []), load_data)
 }
 
 type Msg {
@@ -59,6 +77,7 @@ type Msg {
   SqliteReturnedOpen(Result(sqlite.Database, String))
   SqliteReturnedQuery(Result(Dynamic, String))
   UserTypedQuery(String)
+  SpinFinished
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -76,11 +95,22 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
     SqliteReturnedOpen(load_result) -> {
-      let database = case load_result {
-        Ok(db) -> DbLoaded(db)
-        Error(err) -> DbError(err)
+      let #(database, exec) = case load_result {
+        Ok(db) -> #(
+          DbLoaded(db, Finishing),
+          sqlite.query(db, sql.all_pkgs, [], SqliteReturnedQuery),
+        )
+        Error(err) -> #(DbError(err), effect.none())
       }
-      let model = Model(..model, database:)
+      let model = Model(..model, database:, lucy: Searching)
+      #(model, exec)
+    }
+    SpinFinished -> {
+      let model = case model.database {
+        DbLoaded(database, _) ->
+          Model(..model, database: DbLoaded(database, Done))
+        _ -> model
+      }
       #(model, effect.none())
     }
     SqliteReturnedQuery(query_result) -> {
@@ -105,43 +135,55 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
         }
         |> merge_modules_by_package
-      let model = Model(..model, search_result: query_resp)
+      // the first time we run this will be empty and on loading it gets all packages
+      // so we fill out name list so we can do levenshtein edit distance on package names in gleam
+      // as fts5 trigrams doesnt seem great for eg luster -> lustre
+      let all_pkg_names = case model.all_pkg_names {
+        [] ->
+          query_resp
+          |> list.map(fn(pkg) { pkg.package.name })
+        _ -> model.all_pkg_names
+      }
+
+      let model =
+        Model(
+          ..model,
+          search_result: query_resp,
+          lucy: NotSearching,
+          all_pkg_names:,
+        )
       #(model, effect.none())
     }
     UserTypedQuery(text) -> {
       echo text
+      let text = string.trim(text)
       let exec = case model.database {
-        DbLoaded(db) -> {
+        DbLoaded(db, _) -> {
           case string.to_utf_codepoints(text) {
-            [] ->
-              sqlite.query(
-                db,
-                "SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-                  p.total_downloads, p.recent_downloads, p.latest_version,
-                  NULL AS module, NULL AS snippet
-                FROM packages p
-                ORDER BY p.recent_downloads DESC, p.id",
-                [],
-                SqliteReturnedQuery,
-              )
+            [] -> sqlite.query(db, sql.all_pkgs, [], SqliteReturnedQuery)
             [_] | [_, _] ->
               sqlite.query(
                 db,
-                "SELECT p.name, p.description, p.repository,
-                  p.updated_at, p.owners, p.total_downloads, p.recent_downloads,
-                  p.latest_version, NULL AS module, NULL AS snippet
-                FROM packages p
-                WHERE instr(lower(p.name), lower(?)) > 0
-                ORDER BY p.recent_downloads DESC, p.id",
-                [string.trim(text)],
+                sql.info_only,
+                [text, text, text],
                 SqliteReturnedQuery,
               )
-            [first, second, ..rest] -> {
-              let search_trigrams = query_to_trigrams(first, second, rest)
+            [_, _, ..] -> {
+              let search_trigrams = query_to_trigrams(text)
               sqlite.query(
                 db,
-                code_and_package_sql,
-                [exact_match(text), search_trigrams],
+                sql.code_and_package_sql,
+                [
+                  text
+                    |> string.replace("(", "")
+                    |> string.replace(")", ""),
+                  search_trigrams,
+                  text
+                    |> similar_pkg_names(model.all_pkg_names)
+                    |> echo
+                    |> json.array(json.string)
+                    |> json.to_string,
+                ],
                 SqliteReturnedQuery,
               )
             }
@@ -149,137 +191,22 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
         _ -> effect.none()
       }
+      let model = Model(..model, lucy: Searching)
       #(model, exec)
     }
   }
 }
 
-fn exact_match(text: String) -> String {
-  "\"" <> string.replace(text, "\"", "\"\"") <> "\""
-}
-
-type TrigramsAcc {
-  TrigramsAcc(trigrams: List(String), first: UtfCodepoint, second: UtfCodepoint)
-}
-
-// const code_search_sql =
-//   "SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//     p.total_downloads, p.recent_downloads, p.latest_version,
-//     m.name AS module,
-//     snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?
-//   ORDER BY f.rank"
-
-// const code_and_package_sql =
-//   "SELECT * FROM (
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          NULL AS module, NULL AS snippet,
-//          0 AS kind,
-//          lower(p.name) = lower(?2) AS exact,
-//          -p.recent_downloads AS score
-//   FROM packages_fts f
-//   JOIN packages p ON p.id = f.rowid
-//   WHERE packages_fts MATCH ?1
-//   UNION ALL
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name AS module,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet,
-//          1 AS kind,
-//          0 AS exact,
-//          f.rank AS score
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?1
-// )
-// ORDER BY kind, exact DESC, score"
-
-// const code_and_package_sql =
-//   "SELECT name, description, repository, updated_at, owners,
-//   total_downloads, recent_downloads, latest_version, module, snippet FROM (
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name AS module,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet,
-//          0 AS kind, f.rank AS score
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?1
-//   UNION ALL
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64),
-//          1, f.rank
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?2
-//     AND f.rowid NOT IN (SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1)
-// )
-// ORDER BY kind, score
-// LIMIT 100"
-
-const code_and_package_sql =
-  "WITH exact AS (
-  SELECT rowid AS id FROM modules_fts
-  WHERE modules_fts MATCH ?1 ORDER BY rank LIMIT 100
-),
-fuzzy AS (
-  SELECT rowid AS id FROM modules_fts
-  WHERE modules_fts MATCH ?2
-    AND rowid NOT IN (SELECT id FROM exact)
-  ORDER BY rank LIMIT 100
-)
-SELECT name, description, repository, updated_at, owners,
-  total_downloads, recent_downloads, latest_version, module, snippet FROM (
-  SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-         p.total_downloads, p.recent_downloads, p.latest_version,
-         m.name AS module,
-         snippet(modules_fts, -1, '', '', '', 64) AS snippet,
-         0 AS kind, f.rank AS score
-  FROM modules_fts f
-  JOIN modules m ON m.id = f.rowid
-  JOIN packages p ON p.id = m.package_id
-  WHERE modules_fts MATCH ?1 AND f.rowid IN (SELECT id FROM exact)
-  UNION ALL
-  SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-         p.total_downloads, p.recent_downloads, p.latest_version,
-         m.name,
-         snippet(modules_fts, -1, '', '', '', 64),
-         1, f.rank
-  FROM modules_fts f
-  JOIN modules m ON m.id = f.rowid
-  JOIN packages p ON p.id = m.package_id
-  WHERE modules_fts MATCH ?2 AND f.rowid IN (SELECT id FROM fuzzy)
-)
-ORDER BY kind, score"
-
-fn query_to_trigrams(
-  first: UtfCodepoint,
-  second: UtfCodepoint,
-  rest: List(UtfCodepoint),
-) -> String {
-  let starting_acc = TrigramsAcc(trigrams: [], first:, second:)
-  let acc =
-    list.fold(over: rest, from: starting_acc, with: fn(acc, third) {
-      // FTS5 quoting: wrap in double quotes and double any inner double quote.
-      let trigram =
-        string.from_utf_codepoints([acc.first, acc.second, third])
-        |> string.replace("\"", "\"\"")
-      TrigramsAcc(
-        trigrams: ["\"" <> trigram <> "\"", ..acc.trigrams],
-        first: acc.second,
-        second: third,
-      )
-    })
-  acc.trigrams |> list.unique |> string.join(" OR ")
+fn query_to_trigrams(query: String) -> String {
+  query
+  |> string.lowercase
+  |> string.to_graphemes
+  |> list.window(3)
+  |> list.map(fn(w) {
+    "\"" <> string.replace(string.concat(w), "\"", "\"\"") <> "\""
+  })
+  |> list.unique
+  |> string.join(" OR ")
 }
 
 fn trigram_snippet_decoder() {
@@ -333,34 +260,167 @@ fn merge_modules_by_package(results: List(SearchResult)) -> List(SearchResult) {
   })
 }
 
+fn similar_pkg_names(query: String, pkgs: List(String)) {
+  case string.length(query) {
+    n if n < 50 -> {
+      let acceptable_distance = case n {
+        n if n <= 4 -> 1
+        n if n <= 11 -> 2
+        n if n <= 20 -> 3
+        n if n <= 50 -> 4
+        _ -> panic as "xdd"
+      }
+      list.filter(pkgs, fn(pkg) {
+        edit_distance.levenshtein(query, pkg) <= acceptable_distance
+      })
+    }
+    _ -> []
+  }
+}
+
+// -------------- view ---------------
+
 fn view(model: Model) -> Element(Msg) {
   let time_ago = timeago.new()
+  let animation = case model.database {
+    DbLoaded(_, animation) -> Some(animation)
+    _ -> None
+  }
+  let done = animation == Some(Done)
+  let spin_events = case animation {
+    Some(Finishing) -> [on_spin_iteration(SpinFinished)]
+    _ -> []
+  }
+
   h.div(
     [
+      a.classes([#("done", done)]),
       a.styles([
-        #("max-width", "992px"),
+        #("--w", "770px"),
+        #("box-sizing", "border-box"),
+        #("max-width", "var(--w)"),
         #("margin", "0 auto"),
-        #("padding", "0 1.2rem"),
+        #("padding", "2rem 1.2rem 0"),
       ]),
     ],
     [
+      view_star(done, spin_events, model.lucy),
       h.input([
         a.type_("search"),
         a.placeholder("Search packages"),
-        a.autofocus(True),
+        a.disabled(!done),
         event.on_input(UserTypedQuery) |> event.debounce(200),
         a.styles([
           #("box-sizing", "border-box"),
           #("width", "100%"),
-          #("margin", "2rem 0 1rem"),
-          #("padding", "1rem"),
+          #("height", "3.5rem"),
+          #("margin", "0 0 1rem"),
+          #("padding", "0 1rem 0 3rem"),
           #("font-size", "1rem"),
           #("border", "1px solid #3a3a3a"),
-          #("border-radius", "0.4rem"),
+          #("border-radius", "1.75rem"),
           #("background", "var(--bg)"),
           #("color", "var(--text)"),
+          #("transition", "opacity 1s"),
+          #("opacity", case done {
+            True -> "1"
+            False -> "0"
+          }),
+          #("pointer-events", case done {
+            True -> "auto"
+            False -> "none"
+          }),
         ]),
       ]),
+      view_results(model, time_ago),
+    ],
+  )
+}
+
+fn view_star(
+  done: Bool,
+  spin_events: List(a.Attribute(Msg)),
+  lucy: Search,
+) -> Element(Msg) {
+  let position = case done {
+    False -> [
+      #("top", "50%"),
+      #("left", "50%"),
+      #("width", "min(400px, 70vmin)"),
+      #("height", "min(400px, 70vmin)"),
+    ]
+    True -> [
+      #("top", "3.75rem"),
+      #("left", "calc(max(0px, 50% - var(--w) / 2) + 1.2rem + 24px)"),
+      #("width", "32px"),
+      #("height", "32px"),
+    ]
+  }
+
+  h.div(
+    [
+      a.class("mover"),
+      a.styles([
+        #("position", "absolute"),
+        #("z-index", "1"),
+        #("transform", "translate(-50%, -50%)"),
+        #(
+          "transition",
+          "top var(--move) ease-in-out, width var(--move) ease-in-out, height var(--move) ease-in-out",
+        ),
+        ..position
+      ]),
+    ],
+    [
+      h.div(
+        [
+          a.class("spin"),
+          a.styles([
+            #("position", "relative"),
+            #("width", "100%"),
+            #("height", "100%"),
+          ]),
+          ..spin_events
+        ],
+        [
+          case lucy {
+            Searching ->
+              star_image(
+                "normal",
+                "https://gleam.run/images/lucy/lucydebugfail.svg",
+                "Lucy",
+              )
+            NotSearching ->
+              star_image(
+                "normal",
+                "https://gleam.run/images/lucy/lucy.svg",
+                "Lucy",
+              )
+          },
+          star_image("happy", "https://gleam.run/images/lucy/lucyhappy.svg", ""),
+        ],
+      ),
+    ],
+  )
+}
+
+fn star_image(name: String, src: String, alt: String) -> Element(Msg) {
+  h.img([
+    a.class(name),
+    a.src(src),
+    a.alt(alt),
+    a.styles([
+      #("position", "absolute"),
+      #("width", "100%"),
+      #("height", "100%"),
+    ]),
+  ])
+}
+
+fn view_results(model: Model, time_ago) -> Element(Msg) {
+  case model.database {
+    DbError(message) -> h.p([a.style("margin", "0")], [h.text(message)])
+    DbLoaded(_, Done) ->
       case model.search_result {
         [] -> h.p([a.style("margin", "0")], [h.text("No packages found")])
         search_results ->
@@ -394,9 +454,19 @@ fn view(model: Model) -> Element(Msg) {
               })
             ],
           )
-      },
-    ],
-  )
+      }
+    _ -> element.none()
+  }
+}
+
+fn on_spin_iteration(msg: Msg) -> a.Attribute(Msg) {
+  event.on("animationiteration", {
+    use name <- decode.field("animationName", decode.string)
+    case name {
+      "spin" -> decode.success(msg)
+      _ -> decode.failure(msg, "spin")
+    }
+  })
 }
 
 fn view_result(
@@ -406,7 +476,13 @@ fn view_result(
   let package = result.package
   h.tbody([], [
     h.tr([], [
-      td([h.text(package.name <> "@" <> package.latest_version)]),
+      td([
+        h.span([a.style("font-size", "1.25rem")], [
+          h.text(package.name),
+          h.wbr([]),
+          h.text("@" <> package.latest_version),
+        ]),
+      ]),
       td([h.text(string.join(package.owners, ", "))]),
       td([
         h.div(
@@ -445,10 +521,8 @@ fn view_result(
           ]),
         ],
         [
-          case result.snippet {
-            [] -> h.p([a.style("margin", "0")], [h.text(package.description)])
-            snippets -> h.p([], list.map(snippets, code_snippet))
-          },
+          h.p([a.style("margin", "0")], [h.text(package.description)]),
+          ..list.map(result.snippet, code_snippet)
         ],
       ),
     ]),
@@ -456,11 +530,23 @@ fn view_result(
 }
 
 fn code_snippet(snippet: Snippet) -> Element(msg) {
-  h.div([], [
-    h.p([a.style("margin", "0 0 0.25rem")], [h.text(snippet.module_name)]),
-    h.pre([a.styles([#("margin", "0"), #("white-space", "pre-wrap")])], [
-      h.code([], [h.text(snippet.code)]),
+  h.div([a.styles([#("margin", "0.75rem 0 0.75rem 1rem")])], [
+    h.p([a.styles([#("margin", "0 0 0.25rem"), #("font-weight", "600")])], [
+      h.text(snippet.module_name),
     ]),
+    h.pre(
+      [
+        a.styles([
+          #("margin", "0"),
+          #("padding", "0.5rem 0.75rem"),
+          #("background", "rgba(128, 128, 128, 0.15)"),
+          #("border-radius", "0.3rem"),
+          #("white-space", "pre-wrap"),
+          #("overflow-x", "auto"),
+        ]),
+      ],
+      [h.code([], [h.text(snippet.code)])],
+    ),
   ])
 }
 

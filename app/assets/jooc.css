@@ -2,6 +2,7 @@
   color-scheme: light dark;
   --bg: light-dark(#fffefb, #1e1e1e);
   --text: light-dark(#151515, #fefefc);
+  --move: 1.5s;
 }
 
 html {
@@ -22,4 +23,75 @@ input {
 code,
 pre {
   font-family: ui-monospace, monospace;
+}
+
+/* Animation */
+.spin {
+  animation: spin 2s infinite;
+}
+
+.happy {
+  opacity: 0;
+  animation: show-happy 2s infinite linear;
+}
+
+.normal {
+  animation: show-normal 2s infinite linear;
+}
+
+.done .mover {
+  animation: swing var(--move) ease-in-out;
+}
+
+.done .spin {
+  animation: fly-spin var(--move) ease-in-out forwards;
+}
+
+.done .spin .happy {
+  animation: fly-happy var(--move) linear forwards;
+}
+
+.done .spin .normal {
+  animation: fly-normal var(--move) linear forwards;
+}
+
+@keyframes spin {
+  0%   { transform: rotate(0deg)   scale(1);   animation-timing-function: ease-in; }
+  40%  { transform: rotate(180deg) scale(0.1); animation-timing-function: linear; }
+  65%  { transform: rotate(390deg) scale(1);   animation-timing-function: ease-out; }
+  80%  { transform: rotate(350deg) scale(1);   animation-timing-function: ease-in-out; }
+  90%  { transform: rotate(363deg) scale(1);   animation-timing-function: ease-out; }
+  100% { transform: rotate(360deg) scale(1); }
+}
+
+@keyframes show-happy {
+  0%        { opacity: 0; }
+  3%, 62%   { opacity: 1; }
+  65%, 100% { opacity: 0; }
+}
+
+@keyframes show-normal {
+  0%        { opacity: 1; }
+  3%, 62%   { opacity: 0; }
+  65%, 100% { opacity: 1; }
+}
+
+@keyframes swing {
+  0%  { left: 50%; }
+  55% { left: max(40px, calc(50% - var(--w) / 2 - 60px)); }
+}
+
+@keyframes fly-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes fly-happy {
+  0%, 99% { opacity: 1; }
+  100%    { opacity: 0; }
+}
+
+@keyframes fly-normal {
+  0%, 99% { opacity: 0; }
+  100%    { opacity: 1; }
 }

@@ -1,4 +1,6 @@
-lots of ai use especially sql
+lots of ai use
+- sql - loading in browser, schema, query
+- html/css - results table, loading animation
 
 admin:
 paste cloudflare accesskey,secretkey into input
