@@ -1,9 +1,22 @@
-pub const all_pkgs =
-  "SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
+const all =
+  "SELECT
+  p.name, p.description, p.repository, p.updated_at, p.owners,
   p.total_downloads, p.recent_downloads, p.latest_version,
   NULL AS module, NULL AS snippet
-FROM packages p
-ORDER BY p.recent_downloads DESC, p.id"
+FROM packages p"
+
+pub const all_pkgs_by_downloaded =
+  all <> " ORDER BY p.recent_downloads DESC, p.id"
+
+pub const all_pkgs_by_recent = all <> " ORDER BY p.updated_at DESC, p.id;"
+
+pub const all_pkgs_by_small = all <> " LEFT JOIN modules m ON m.package_id = p.id
+GROUP BY p.id
+ORDER BY COALESCE(SUM(length(m.source)), 0) ASC, p.id;"
+
+pub const all_pkgs_by_big = all <> " LEFT JOIN modules m ON m.package_id = p.id
+GROUP BY p.id
+ORDER BY COALESCE(SUM(length(m.source)), 0) DESC, p.id;"
 
 pub const info_only =
   "SELECT p.name, p.description, p.repository,
@@ -14,70 +27,6 @@ WHERE instr(lower(p.name), lower(?)) > 0
    OR instr(lower(p.description), lower(?)) > 0
    OR instr(lower(p.owners), lower(?)) > 0
 ORDER BY p.recent_downloads DESC, p.id"
-
-// const code_search_sql =
-//   "SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//     p.total_downloads, p.recent_downloads, p.latest_version,
-//     m.name AS module,
-//     snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?
-//   ORDER BY f.rank"
-
-// const code_and_package_sql =
-//   "SELECT * FROM (
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          NULL AS module, NULL AS snippet,
-//          0 AS kind,
-//          lower(p.name) = lower(?2) AS exact,
-//          -p.recent_downloads AS score
-//   FROM packages_fts f
-//   JOIN packages p ON p.id = f.rowid
-//   WHERE packages_fts MATCH ?1
-//   UNION ALL
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name AS module,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet,
-//          1 AS kind,
-//          0 AS exact,
-//          f.rank AS score
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?1
-// )
-// ORDER BY kind, exact DESC, score"
-
-// const code_and_package_sql =
-//   "SELECT name, description, repository, updated_at, owners,
-//   total_downloads, recent_downloads, latest_version, module, snippet FROM (
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name AS module,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64) AS snippet,
-//          0 AS kind, f.rank AS score
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?1
-//   UNION ALL
-//   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-//          p.total_downloads, p.recent_downloads, p.latest_version,
-//          m.name,
-//          snippet(modules_fts, -1, char(2), char(3), '', 64),
-//          1, f.rank
-//   FROM modules_fts f
-//   JOIN modules m ON m.id = f.rowid
-//   JOIN packages p ON p.id = m.package_id
-//   WHERE modules_fts MATCH ?2
-//     AND f.rowid NOT IN (SELECT rowid FROM modules_fts WHERE modules_fts MATCH ?1)
-// )
-// ORDER BY kind, score
-// LIMIT 100"
 
 pub const code_and_package_sql =
   "WITH pkg AS (

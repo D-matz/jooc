@@ -34,6 +34,7 @@ type Model {
     search_result: List(SearchResult),
     lucy: Search,
     all_pkg_names: List(String),
+    search_text: String,
   )
 }
 
@@ -69,15 +70,16 @@ fn init(_) -> #(Model, Effect(Msg)) {
     req
     |> request.set_body(<<>>)
     |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
-  #(Model(DbLoading, [], NotSearching, []), load_data)
+  #(Model(DbLoading, [], NotSearching, [], ""), load_data)
 }
 
 type Msg {
   ServerReturnedData(Result(Response(BitArray), rsvp.Error(BitArray)))
   SqliteReturnedOpen(Result(sqlite.Database, String))
+  SpinFinished
   SqliteReturnedQuery(Result(Dynamic, String))
   UserTypedQuery(String)
-  SpinFinished
+  UserClickedButton(String)
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -98,7 +100,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let #(database, exec) = case load_result {
         Ok(db) -> #(
           DbLoaded(db, Finishing),
-          sqlite.query(db, sql.all_pkgs, [], SqliteReturnedQuery),
+          sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery),
         )
         Error(err) -> #(DbError(err), effect.none())
       }
@@ -160,7 +162,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let exec = case model.database {
         DbLoaded(db, _) -> {
           case string.to_utf_codepoints(text) {
-            [] -> sqlite.query(db, sql.all_pkgs, [], SqliteReturnedQuery)
+            [] ->
+              sqlite.query(
+                db,
+                sql.all_pkgs_by_recent,
+                [],
+                SqliteReturnedQuery,
+              )
             [_] | [_, _] ->
               sqlite.query(
                 db,
@@ -191,7 +199,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
         _ -> effect.none()
       }
-      let model = Model(..model, lucy: Searching)
+      let model = Model(..model, lucy: Searching, search_text: text)
+      #(model, exec)
+    }
+    UserClickedButton(premade_query) -> {
+      let exec = case model.database {
+        DbLoaded(db, _) -> {
+          sqlite.query(db, premade_query, [], SqliteReturnedQuery)
+        }
+        _ -> effect.none()
+      }
+      let model = Model(..model, lucy: Searching, search_text: "")
       #(model, exec)
     }
   }
@@ -281,7 +299,6 @@ fn similar_pkg_names(query: String, pkgs: List(String)) {
 // -------------- view ---------------
 
 fn view(model: Model) -> Element(Msg) {
-  let time_ago = timeago.new()
   let animation = case model.database {
     DbLoaded(_, animation) -> Some(animation)
     _ -> None
@@ -304,8 +321,10 @@ fn view(model: Model) -> Element(Msg) {
       ]),
     ],
     [
-      view_star(done, spin_events, model.lucy),
+      view_star(done, spin_events, model),
       h.input([
+        // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
+        a.value(model.search_text),
         a.type_("search"),
         a.placeholder("Search packages"),
         a.disabled(!done),
@@ -332,7 +351,7 @@ fn view(model: Model) -> Element(Msg) {
           }),
         ]),
       ]),
-      view_results(model, time_ago),
+      view_results(model, timeago.new()),
     ],
   )
 }
@@ -340,7 +359,7 @@ fn view(model: Model) -> Element(Msg) {
 fn view_star(
   done: Bool,
   spin_events: List(a.Attribute(Msg)),
-  lucy: Search,
+  model: Model,
 ) -> Element(Msg) {
   let position = case done {
     False -> [
@@ -383,19 +402,19 @@ fn view_star(
           ..spin_events
         ],
         [
-          case lucy {
-            Searching ->
-              star_image(
-                "normal",
-                "https://gleam.run/images/lucy/lucydebugfail.svg",
-                "Lucy",
-              )
-            NotSearching ->
-              star_image(
-                "normal",
-                "https://gleam.run/images/lucy/lucy.svg",
-                "Lucy",
-              )
+          {
+            let svg = case model.lucy {
+              Searching -> "https://gleam.run/images/lucy/lucyhappy.svg"
+              NotSearching ->
+                // this is a mess because the css to control during spin animation is class slop
+                // and we know havent loaded yet because all_pkg_names is empty
+                case model.search_result, model.all_pkg_names {
+                  _, [] -> "https://gleam.run/images/lucy/lucy.svg"
+                  [], _ -> "https://gleam.run/images/lucy/lucydebugfail.svg"
+                  _, _ -> "https://gleam.run/images/lucy/lucy.svg"
+                }
+            }
+            star_image("normal", svg, "Lucy")
           },
           star_image("happy", "https://gleam.run/images/lucy/lucyhappy.svg", ""),
         ],
@@ -419,42 +438,68 @@ fn star_image(name: String, src: String, alt: String) -> Element(Msg) {
 
 fn view_results(model: Model, time_ago) -> Element(Msg) {
   case model.database {
+    // never actually get here we just echo err
+    // should probably take it out
     DbError(message) -> h.p([a.style("margin", "0")], [h.text(message)])
     DbLoaded(_, Done) ->
-      case model.search_result {
-        [] -> h.p([a.style("margin", "0")], [h.text("No packages found")])
-        search_results ->
-          h.table(
-            [
-              a.styles([
-                #("width", "100%"),
-                #("table-layout", "fixed"),
-                #("border-collapse", "collapse"),
-              ]),
-            ],
-            [
-              h.colgroup([], [
-                h.col([a.style("width", "30%")]),
-                h.col([a.style("width", "20%")]),
-                h.col([a.style("width", "20%")]),
-                h.col([a.style("width", "15%")]),
-                h.col([a.style("width", "15%")]),
-              ]),
-              h.thead([], [
-                h.tr([], [
-                  th("package"),
-                  th("author"),
-                  th("links"),
-                  th("updated"),
-                  th("downloads"),
+      h.div([], [
+        case model.search_result {
+          [] ->
+            h.p([a.style("margin", "0")], [
+              h.text(
+                "No matching packages found here, but this is not a complete index of all gleam packages. Maybe try ",
+              ),
+              link(
+                "https://packages.gleam.run?search=" <> model.search_text,
+                "https://packages.gleam.run?search=" <> model.search_text,
+              ),
+            ])
+          search_results ->
+            h.table(
+              [
+                a.styles([
+                  #("width", "100%"),
+                  #("table-layout", "fixed"),
+                  #("border-collapse", "collapse"),
                 ]),
-              ]),
-              ..list.map(search_results, fn(search_result) {
-                view_result(search_result, time_ago)
-              })
-            ],
-          )
-      }
+              ],
+              [
+                h.colgroup([], [
+                  h.col([a.style("width", "30%")]),
+                  h.col([a.style("width", "20%")]),
+                  h.col([a.style("width", "20%")]),
+                  h.col([a.style("width", "15%")]),
+                  h.col([a.style("width", "15%")]),
+                ]),
+                h.thead([], [
+                  h.tr([], [
+                    th("package"),
+                    th("author"),
+                    th("links"),
+                    th("updated"),
+                    th("downloads"),
+                  ]),
+                ]),
+                ..list.map(search_results, fn(search_result) {
+                  view_result(search_result, time_ago)
+                })
+              ],
+            )
+        },
+        h.footer([a.style("padding-top", "10px"), a.style("padding-bottom", "10px")], [
+          h.text(
+            "Gleam Lucy starfish mascot © 2026 Louis Pilfold. Thanks also to ",
+          ),
+          link("https://hex.pm/", "hex.pm"),
+          h.text("."),
+          h.br([]),
+          h.text("See all packages ordered by: "),
+          btn("new", sql.all_pkgs_by_recent),
+          btn("popular", sql.all_pkgs_by_downloaded),
+          btn("big", sql.all_pkgs_by_big),
+          btn("small", sql.all_pkgs_by_small),
+        ]),
+      ])
     _ -> element.none()
   }
 }
@@ -585,5 +630,18 @@ fn link(href: String, label: String) -> Element(msg) {
       ]),
     ],
     [h.text(label)],
+  )
+}
+
+fn btn(text, premade_query) {
+  h.button(
+    [
+      event.on_click(UserClickedButton(premade_query)),
+      a.style("margin", "5px"),
+      a.style("padding", "5px 10px"),
+      a.style("color", "var(--text)"),
+      a.style("cursor", "pointer"),
+    ],
+    [h.text(text)],
   )
 }
