@@ -1,0 +1,25 @@
+:root {
+  color-scheme: light dark;
+  --bg: light-dark(#fffefb, #1e1e1e);
+  --text: light-dark(#151515, #fefefc);
+}
+
+html {
+  scrollbar-gutter: stable;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+}
+
+input {
+  font-family: system-ui, sans-serif;
+}
+
+code,
+pre {
+  font-family: ui-monospace, monospace;
+}

@@ -12,9 +12,11 @@ gleam_hexpm = ">= 3.0.1 and < 4.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
 shared = {path = "../shared"}
 gleam_http = ">= 4.5.0 and < 5.0.0"
+timeago = ">= 2.5.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
 
 [tools.lustre.html]
 scripts = [{ src = "/sqlite3-worker1-promiser.js" }]
+stylesheets = [{ href = "/jooc.css" }]
