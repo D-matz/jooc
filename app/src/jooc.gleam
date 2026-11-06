@@ -8,7 +8,8 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleam/time/timestamp
 import lustre
@@ -44,7 +45,7 @@ type SearchResult {
 }
 
 type Snippet {
-  Snippet(module_name: String, code: String)
+  Snippet(module_name: String, code: List(String))
 }
 
 type Db {
@@ -117,7 +118,6 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, effect.none())
     }
     SqliteReturnedQuery(query_result) -> {
-      echo "SqliteReturnedQuery"
       let query_resp =
         case query_result {
           Ok(query_resp) -> {
@@ -158,12 +158,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, effect.none())
     }
     UserTypedQuery(text) -> {
-      echo text
       let model = Model(..model, search_text: text)
       let text = string.trim(text)
       let exec = case model.database {
         DbLoaded(db, _) -> {
-          case string.to_utf_codepoints(text) {
+          let chars = string.to_graphemes(text)
+          case chars {
             [] ->
               sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery)
             [_] | [_, _] ->
@@ -174,6 +174,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 SqliteReturnedQuery,
               )
             [_, _, ..] -> {
+              // fn parser doesnt like anonymous fn
+              // fn(x){x+1} -> fn w(x){x+1}
+              let text = case chars {
+                ["f", "n", "(", ..rest]
+                | ["f", "n", " ", "(", ..rest]
+                | ["f", "n", " ", " ", "(", ..rest] -> {
+                  string.concat(["f", "n", " ", "w", "(", ..rest])
+                }
+                _ -> text
+              }
               case
                 string.starts_with(text, "fn")
                 || string.starts_with(text, "pub fn")
@@ -217,20 +227,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 fn search_text(text: String, db: sqlite.Database, model: Model) {
   sqlite.query(
     db,
-    sql.code_and_package_sql,
+    sql.code_and_package,
     [
-      text
-        |> string.replace("(", "")
-        |> string.replace(")", ""),
+      text,
       query_to_trigrams(text),
       text
         |> similar_pkg_names(model.all_pkg_names)
-        |> echo
         |> json.array(json.string)
         |> json.to_string,
+      bm25_threshold(text),
     ],
     SqliteReturnedQuery,
   )
+}
+
+fn bm25_threshold(text: String) -> String {
+  let trigram_count = string.length(text) - 4
+  int.to_string(-4 * trigram_count)
 }
 
 fn query_to_trigrams(query: String) -> String {
@@ -261,7 +274,7 @@ fn search_result_decoder() -> decode.Decoder(SearchResult) {
   use module_name <- decode.field(8, decode.optional(decode.string))
   use code <- decode.field(9, decode.optional(decode.string))
   let snippet = case module_name, code {
-    Some(module_name), Some(code) -> [Snippet(module_name:, code:)]
+    Some(module_name), Some(code) -> [Snippet(module_name:, code: [code])]
     _, _ -> []
   }
   decode.success(SearchResult(
@@ -280,19 +293,22 @@ fn search_result_decoder() -> decode.Decoder(SearchResult) {
 }
 
 fn merge_modules_by_package(results: List(SearchResult)) -> List(SearchResult) {
-  let order = results |> list.map(fn(r) { r.package.name }) |> list.unique
   let groups = list.group(results, fn(r) { r.package.name })
-  list.filter_map(order, fn(name) {
-    case dict.get(groups, name) {
-      Ok([first, ..] as group) ->
-        Ok(
-          SearchResult(
-            ..first,
-            snippet: list.flat_map(group, fn(r) { r.snippet }),
-          ),
-        )
-      _ -> Error(Nil)
-    }
+  results
+  |> list.map(fn(r) { r.package.name })
+  |> list.unique
+  |> list.filter_map(fn(name) {
+    use group <- result.try(dict.get(groups, name))
+    use first <- result.map(list.first(group))
+    let snippet =
+      group
+      |> list.flat_map(fn(r) { r.snippet })
+      |> list.group(fn(s) { s.module_name })
+      |> dict.map_values(fn(name, same) {
+        Snippet(name, list.flat_map(same, fn(s) { s.code }))
+      })
+      |> dict.values
+    SearchResult(..first, snippet: snippet)
   })
 }
 
@@ -344,7 +360,7 @@ fn view(model: Model) -> Element(Msg) {
         // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
         a.value(model.search_text),
         a.type_("search"),
-        a.placeholder("Search packages"),
+        a.placeholder("search package by name, code, type, fn"),
         a.disabled(!done),
         event.on_input(UserTypedQuery) |> event.debounce(200),
         a.styles([
@@ -507,6 +523,10 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
         h.footer(
           [a.style("padding-top", "10px"), a.style("padding-bottom", "10px")],
           [
+            h.text("This package list is "),
+            h.strong([], [h.text("not maintained by the Gleam team")]),
+            h.text(", it is not official or objective or anything."),
+            h.br([]),
             h.text(
               "Gleam Lucy starfish mascot © 2026 Louis Pilfold. Thanks also to ",
             ),
@@ -600,19 +620,22 @@ fn code_snippet(snippet: Snippet) -> Element(msg) {
     h.p([a.styles([#("margin", "0 0 0.25rem"), #("font-weight", "600")])], [
       h.text(snippet.module_name),
     ]),
-    h.pre(
-      [
-        a.styles([
-          #("margin", "0"),
-          #("padding", "0.5rem 0.75rem"),
-          #("background", "rgba(128, 128, 128, 0.15)"),
-          #("border-radius", "0.3rem"),
-          #("white-space", "pre-wrap"),
-          #("overflow-x", "auto"),
-        ]),
-      ],
-      [h.code([], [h.text(snippet.code)])],
-    ),
+    ..list.map(snippet.code, fn(source) {
+      h.pre(
+        [
+          a.styles([
+            #("margin", "0"),
+            #("margin-bottom", "0.5rem"),
+            #("padding", "0.5rem 0.75rem"),
+            #("background", "rgba(128, 128, 128, 0.15)"),
+            #("border-radius", "0.3rem"),
+            #("white-space", "pre-wrap"),
+            #("overflow-x", "auto"),
+          ]),
+        ],
+        [h.code([], [h.text(source)])],
+      )
+    })
   ])
 }
 

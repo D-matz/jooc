@@ -23,11 +23,11 @@ pub const info_only = all <> " WHERE instr(lower(p.name), lower(?)) > 0
    OR instr(lower(p.owners), lower(?)) > 0
 ORDER BY p.recent_downloads DESC, p.id"
 
-pub const code_and_package_sql =
+pub const code_and_package =
   "WITH pkg AS (
   SELECT rowid AS id, rank AS score FROM packages_fts
   WHERE packages_fts MATCH ?2
-    AND rank < -15.0
+    AND rank < ?4
 
   UNION
 
@@ -40,12 +40,13 @@ pub const code_and_package_sql =
 ),
 exact AS (
   SELECT rowid AS id FROM modules_fts
-  WHERE modules_fts MATCH ?1 ORDER BY rank
+  WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
+  ORDER BY rank
 ),
 fuzzy AS (
   SELECT rowid AS id FROM modules_fts
   WHERE modules_fts MATCH ?2
-    AND rank < -15.0
+    AND rank < -9.0
     AND rowid NOT IN (SELECT id FROM exact)
   ORDER BY rank LIMIT 20
 )
@@ -70,7 +71,8 @@ SELECT name, description, repository, updated_at, owners,
   FROM modules_fts f
   JOIN modules m ON m.id = f.rowid
   JOIN packages p ON p.id = m.package_id
-  WHERE modules_fts MATCH ?1 AND f.rowid IN (SELECT id FROM exact)
+  WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
+    AND f.rowid IN (SELECT id FROM exact)
     AND p.id NOT IN (SELECT id FROM pkg)
   UNION ALL
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
