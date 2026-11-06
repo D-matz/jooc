@@ -1,8 +1,0 @@
-[packages]
-glexer = "2.5.0"
-argv = "1.1.0"
-splitter = "1.3.0"
-glance = "7.0.0"
-gleam_stdlib = "1.0.5"
-
-[git]

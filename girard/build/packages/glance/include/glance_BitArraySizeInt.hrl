@@ -1,1 +1,0 @@
--record(bit_array_size_int, {location :: glance:span(), value :: binary()}).

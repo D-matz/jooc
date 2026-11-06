@@ -1,4 +1,0 @@
--record(tuple, {
-    location :: glance:span(),
-    elements :: list(glance:expression())
-}).

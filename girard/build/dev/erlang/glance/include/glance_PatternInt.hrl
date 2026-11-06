@@ -1,4 +1,0 @@
--record(pattern_int, {
-    location :: glance:span(),
-    value :: binary()
-}).

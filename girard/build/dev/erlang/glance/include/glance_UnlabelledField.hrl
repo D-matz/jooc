@@ -1,3 +1,0 @@
--record(unlabelled_field, {
-    item :: any()
-}).

@@ -1,3 +1,0 @@
--record(unlabelled_variant_field, {
-    item :: glance:type()
-}).

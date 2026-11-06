@@ -1,4 +1,0 @@
--record(span, {
-    start :: integer(),
-    'end' :: integer()
-}).
