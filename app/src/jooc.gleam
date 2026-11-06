@@ -502,8 +502,8 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
                   h.col([a.style("width", "30%")]),
                   h.col([a.style("width", "20%")]),
                   h.col([a.style("width", "20%")]),
-                  h.col([a.style("width", "15%")]),
-                  h.col([a.style("width", "15%")]),
+                  h.col([a.style("width", "17%")]),
+                  h.col([a.style("width", "13%")]),
                 ]),
                 h.thead([], [
                   h.tr([], [
