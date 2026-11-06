@@ -1,0 +1,4 @@
+-record(float, {
+    location :: glance:span(),
+    value :: binary()
+}).

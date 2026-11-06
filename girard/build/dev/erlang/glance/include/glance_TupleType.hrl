@@ -1,0 +1,4 @@
+-record(tuple_type, {
+    location :: glance:span(),
+    elements :: list(glance:type())
+}).

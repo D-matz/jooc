@@ -18,12 +18,7 @@ pub const all_pkgs_by_big = all <> " LEFT JOIN modules m ON m.package_id = p.id
 GROUP BY p.id
 ORDER BY COALESCE(SUM(length(m.source)), 0) DESC, p.id;"
 
-pub const info_only =
-  "SELECT p.name, p.description, p.repository,
-  p.updated_at, p.owners, p.total_downloads, p.recent_downloads,
-  p.latest_version, NULL AS module, NULL AS snippet
-FROM packages p
-WHERE instr(lower(p.name), lower(?)) > 0
+pub const info_only = all <> " WHERE instr(lower(p.name), lower(?)) > 0
    OR instr(lower(p.description), lower(?)) > 0
    OR instr(lower(p.owners), lower(?)) > 0
 ORDER BY p.recent_downloads DESC, p.id"
@@ -101,3 +96,19 @@ ORDER BY
   ),
   kind,
   score"
+
+pub const canonical =
+  "SELECT
+  p.name, p.description, p.repository, p.updated_at, p.owners,
+  p.total_downloads, p.recent_downloads, p.latest_version,
+  m.name AS module,
+  CAST(
+    substr(CAST(m.source AS BLOB), d.start_pos + 1, d.end_pos - d.start_pos)
+    AS TEXT
+  ) AS snippet
+FROM canonical_forms c
+JOIN definitions d ON d.canonical_id = c.id
+JOIN modules m ON m.id = d.module_id
+JOIN packages p ON p.id = m.package_id
+WHERE c.canonical = ?1
+ORDER BY p.recent_downloads DESC, p.id, m.name, d.start_pos"

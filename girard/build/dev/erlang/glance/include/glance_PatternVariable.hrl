@@ -1,0 +1,4 @@
+-record(pattern_variable, {
+    location :: glance:span(),
+    name :: binary()
+}).

@@ -1,0 +1,4 @@
+-record(negate_int, {
+    location :: glance:span(),
+    value :: glance:expression()
+}).

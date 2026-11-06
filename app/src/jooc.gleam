@@ -1,3 +1,4 @@
+import canonical
 import edit_distance
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
@@ -158,17 +159,13 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
     UserTypedQuery(text) -> {
       echo text
+      let model = Model(..model, search_text: text)
       let text = string.trim(text)
       let exec = case model.database {
         DbLoaded(db, _) -> {
           case string.to_utf_codepoints(text) {
             [] ->
-              sqlite.query(
-                db,
-                sql.all_pkgs_by_recent,
-                [],
-                SqliteReturnedQuery,
-              )
+              sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery)
             [_] | [_, _] ->
               sqlite.query(
                 db,
@@ -177,29 +174,31 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 SqliteReturnedQuery,
               )
             [_, _, ..] -> {
-              let search_trigrams = query_to_trigrams(text)
-              sqlite.query(
-                db,
-                sql.code_and_package_sql,
-                [
-                  text
-                    |> string.replace("(", "")
-                    |> string.replace(")", ""),
-                  search_trigrams,
-                  text
-                    |> similar_pkg_names(model.all_pkg_names)
-                    |> echo
-                    |> json.array(json.string)
-                    |> json.to_string,
-                ],
-                SqliteReturnedQuery,
-              )
+              case
+                string.starts_with(text, "fn")
+                || string.starts_with(text, "pub fn")
+                || string.starts_with(text, "type")
+                || string.starts_with(text, "pub type")
+              {
+                True ->
+                  case canonical.parse(text) {
+                    Ok([parsed_canonical]) ->
+                      sqlite.query(
+                        db,
+                        sql.canonical,
+                        [echo parsed_canonical.canonical],
+                        SqliteReturnedQuery,
+                      )
+                    _ -> search_text(text, db, model)
+                  }
+                False -> search_text(text, db, model)
+              }
             }
           }
         }
         _ -> effect.none()
       }
-      let model = Model(..model, lucy: Searching, search_text: text)
+      let model = Model(..model, lucy: Searching)
       #(model, exec)
     }
     UserClickedButton(premade_query) -> {
@@ -213,6 +212,25 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       #(model, exec)
     }
   }
+}
+
+fn search_text(text: String, db: sqlite.Database, model: Model) {
+  sqlite.query(
+    db,
+    sql.code_and_package_sql,
+    [
+      text
+        |> string.replace("(", "")
+        |> string.replace(")", ""),
+      query_to_trigrams(text),
+      text
+        |> similar_pkg_names(model.all_pkg_names)
+        |> echo
+        |> json.array(json.string)
+        |> json.to_string,
+    ],
+    SqliteReturnedQuery,
+  )
 }
 
 fn query_to_trigrams(query: String) -> String {
@@ -486,19 +504,22 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
               ],
             )
         },
-        h.footer([a.style("padding-top", "10px"), a.style("padding-bottom", "10px")], [
-          h.text(
-            "Gleam Lucy starfish mascot © 2026 Louis Pilfold. Thanks also to ",
-          ),
-          link("https://hex.pm/", "hex.pm"),
-          h.text("."),
-          h.br([]),
-          h.text("See all packages ordered by: "),
-          btn("new", sql.all_pkgs_by_recent),
-          btn("popular", sql.all_pkgs_by_downloaded),
-          btn("big", sql.all_pkgs_by_big),
-          btn("small", sql.all_pkgs_by_small),
-        ]),
+        h.footer(
+          [a.style("padding-top", "10px"), a.style("padding-bottom", "10px")],
+          [
+            h.text(
+              "Gleam Lucy starfish mascot © 2026 Louis Pilfold. Thanks also to ",
+            ),
+            link("https://hex.pm/", "hex.pm"),
+            h.text("."),
+            h.br([]),
+            h.text("See all packages ordered by: "),
+            btn("new", sql.all_pkgs_by_recent),
+            btn("popular", sql.all_pkgs_by_downloaded),
+            btn("big", sql.all_pkgs_by_big),
+            btn("small", sql.all_pkgs_by_small),
+          ],
+        ),
       ])
     _ -> element.none()
   }
