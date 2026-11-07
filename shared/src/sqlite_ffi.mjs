@@ -19,7 +19,7 @@ export async function open(bits) {
   }
 }
 
-async function execute(db, sql, bind, read) {
+export async function query(db, sql, bind) {
   try {
     const response = await db.promiser({
       type: "exec",
@@ -28,14 +28,11 @@ async function execute(db, sql, bind, read) {
         sql,
         bind: bind.toArray(), // Gleam List -> JS array
         rowMode: "array",
-        resultRows: read ? [] : undefined
+        resultRows: []
       }
     });
-    return new Ok(read ? response.result.resultRows : undefined);
+    return new Ok(response.result.resultRows);
   } catch (e) {
     return new Error(e?.result?.message ?? String(e));
   }
 }
-
-export const exec = (db, sql, bind) => execute(db, sql, bind, false);
-export const query = (db, sql, bind) => execute(db, sql, bind, true);

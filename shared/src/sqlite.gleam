@@ -11,15 +11,6 @@ pub fn open(
   perform(fn() { do_open(bytes) }, to_msg)
 }
 
-pub fn exec(
-  db: Database,
-  sql: String,
-  bind: List(String),
-  to_msg: fn(Result(Nil, String)) -> msg,
-) -> Effect(msg) {
-  perform(fn() { do_exec(db, sql, bind) }, to_msg)
-}
-
 pub fn query(
   db: Database,
   sql: String,
@@ -40,13 +31,6 @@ fn perform(
 
 @external(javascript, "./sqlite_ffi.mjs", "open")
 fn do_open(bytes: BitArray) -> Promise(Result(Database, String))
-
-@external(javascript, "./sqlite_ffi.mjs", "exec")
-fn do_exec(
-  db: Database,
-  sql: String,
-  bind: List(String),
-) -> Promise(Result(Nil, String))
 
 @external(javascript, "./sqlite_ffi.mjs", "query")
 fn do_query(
