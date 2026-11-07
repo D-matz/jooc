@@ -8,16 +8,18 @@ import gleam/http/response.{type Response}
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/timestamp
+import gleam/uri
 import lustre
 import lustre/attribute as a
 import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html as h
 import lustre/event
+import modem
 import rsvp
 import sql
 import sqlite
@@ -37,6 +39,7 @@ type Model {
     lucy: Search,
     all_pkg_names: List(String),
     search_text: String,
+    query_from_initial_uri: Option(String),
   )
 }
 
@@ -68,11 +71,27 @@ const data_src = "https://bucket.correctarity.com/packages.sqlite"
 
 fn init(_) -> #(Model, Effect(Msg)) {
   let assert Ok(req) = request.to(data_src)
+  let query_from_initial_uri = case modem.initial_uri() {
+    Ok(initial_uri) ->
+      case initial_uri.query {
+        Some(initial_uri_query) ->
+          case uri.percent_decode(initial_uri_query) {
+            Ok(initial_uri_query) -> Some(initial_uri_query)
+            Error(_) -> None
+          }
+        None -> None
+      }
+    Error(_) -> None
+  }
+
   let load_data =
     req
     |> request.set_body(<<>>)
     |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
-  #(Model(DbLoading, [], NotSearching, [], ""), load_data)
+  #(
+    Model(DbLoading, [], NotSearching, [], "", query_from_initial_uri),
+    load_data,
+  )
 }
 
 type Msg {
@@ -141,76 +160,31 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       // the first time we run this will be empty and on loading it gets all packages
       // so we fill out name list so we can do levenshtein edit distance on package names in gleam
       // as fts5 trigrams doesnt seem great for eg luster -> lustre
-      let all_pkg_names = case model.all_pkg_names {
-        [] ->
-          query_resp
-          |> list.map(fn(pkg) { pkg.package.name })
-        _ -> model.all_pkg_names
-      }
+      // also first time we get response, run user's initial query from url...
+      // can't just run it immediately because we need to load package names first here
+      // the pkg name list kind of doing double duty to indicate we ready for user url query, kind of confusing
 
-      let model =
-        Model(
-          ..model,
-          search_result: query_resp,
-          lucy: NotSearching,
-          all_pkg_names:,
-        )
-      #(model, effect.none())
-    }
-    UserTypedQuery(text) -> {
-      let model = Model(..model, search_text: text)
-      let text = string.trim(text)
-      let exec = case model.database {
-        DbLoaded(db, _) -> {
-          let chars = string.to_graphemes(text)
-          case chars {
-            [] ->
-              sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery)
-            [_] | [_, _] ->
-              sqlite.query(
-                db,
-                sql.info_only,
-                [text, text, text],
-                SqliteReturnedQuery,
-              )
-            [_, _, ..] -> {
-              // fn parser doesnt like anonymous fn
-              // fn(x){x+1} -> fn w(x){x+1}
-              let text = case chars {
-                ["f", "n", "(", ..rest]
-                | ["f", "n", " ", "(", ..rest]
-                | ["f", "n", " ", " ", "(", ..rest] -> {
-                  string.concat(["f", "n", " ", "w", "(", ..rest])
-                }
-                _ -> text
-              }
-              case
-                string.starts_with(text, "fn")
-                || string.starts_with(text, "pub fn")
-                || string.starts_with(text, "type")
-                || string.starts_with(text, "pub type")
-              {
-                True ->
-                  case canonical.parse(text) {
-                    Ok([parsed_canonical]) ->
-                      sqlite.query(
-                        db,
-                        sql.canonical,
-                        [echo parsed_canonical.canonical],
-                        SqliteReturnedQuery,
-                      )
-                    _ -> search_text(text, db, model)
-                  }
-                False -> search_text(text, db, model)
-              }
+      case model.all_pkg_names {
+        [] -> {
+          let all_pkg_names = list.map(query_resp, fn(pkg) { pkg.package.name })
+          let model = Model(..model, all_pkg_names:)
+          case model.query_from_initial_uri {
+            Some(text) -> text_to_query(text, model)
+            None -> {
+              let model =
+                Model(..model, search_result: query_resp, lucy: NotSearching)
+              #(model, effect.none())
             }
           }
         }
-        _ -> effect.none()
+        _ -> {
+          let model =
+            Model(..model, search_result: query_resp, lucy: NotSearching)
+          #(model, effect.none())
+        }
       }
-      let model = Model(..model, lucy: Searching)
-      #(model, exec)
     }
+    UserTypedQuery(text) -> text_to_query(text, model)
     UserClickedButton(premade_query) -> {
       let exec = case model.database {
         DbLoaded(db, _) -> {
@@ -224,26 +198,85 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   }
 }
 
-fn search_text(text: String, db: sqlite.Database, model: Model) {
-  sqlite.query(
-    db,
-    sql.code_and_package,
-    [
-      text,
-      query_to_trigrams(text),
-      text
-        |> similar_pkg_names(model.all_pkg_names)
-        |> json.array(json.string)
-        |> json.to_string,
-      bm25_threshold(text),
-    ],
-    SqliteReturnedQuery,
-  )
+// usually query text is from the user typing, but could also be from initial url
+fn text_to_query(text, model) {
+  let push_url = modem.push("", Some(uri.percent_encode(text)), None)
+  let model = Model(..model, search_text: text)
+  let text = string.trim(text)
+  let exec = case model.database {
+    DbLoaded(db, _) -> {
+      let chars = string.to_graphemes(text)
+      case chars {
+        [] -> sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery)
+        [_] | [_, _] ->
+          sqlite.query(
+            db,
+            sql.info_only,
+            [text, text, text],
+            SqliteReturnedQuery,
+          )
+        [_, _, ..] -> {
+          case parse_type_or_fn(chars) {
+            Ok(canonical) ->
+              sqlite.query(db, sql.canonical, [canonical], SqliteReturnedQuery)
+            Error(_) -> {
+              let trigram_count = string.length(text) - 4
+              let bm25_threshold = int.to_string(-6 * trigram_count)
+              sqlite.query(
+                db,
+                sql.code_and_package,
+                [
+                  text,
+                  query_to_trigrams(text),
+                  text
+                    |> similar_pkg_names(model.all_pkg_names)
+                    |> json.array(json.string)
+                    |> json.to_string,
+                  bm25_threshold,
+                ],
+                SqliteReturnedQuery,
+              )
+            }
+          }
+        }
+      }
+    }
+    _ -> effect.none()
+  }
+  let effect = effect.batch([exec, push_url])
+  let model = Model(..model, lucy: Searching)
+  #(model, effect)
 }
 
-fn bm25_threshold(text: String) -> String {
-  let trigram_count = string.length(text) - 4
-  int.to_string(-4 * trigram_count)
+// see if we can parse the user's query into a type or function
+fn parse_type_or_fn(query_chars: List(String)) -> Result(String, Nil) {
+  // fn parser doesnt like anonymous fn
+  // so we help out eg fn(x){x+1} -> fn w(x){x+1}
+  let query_chars = case query_chars {
+    ["f", "n", "(", ..rest]
+    | ["f", "n", " ", "(", ..rest]
+    | ["f", "n", " ", " ", "(", ..rest] -> {
+      Ok(["f", "n", " ", "w", "(", ..rest])
+    }
+    ["{", ..rest] -> Ok(["t", "y", "p", "e", " ", "W", "{", ..rest])
+    ["f", "n", ..]
+    | ["p", "u", "b", " ", "f", "n", ..]
+    | ["t", "y", "p", "e", ..]
+    | ["p", "u", "b", " ", "t", "y", "p", "e", ..] -> Ok(query_chars)
+    _ -> Error(Nil)
+  }
+  let parsed = case query_chars {
+    Error(Nil) -> Error(Nil)
+    Ok(query_chars) ->
+      case query_chars |> string.concat |> canonical.parse {
+        Ok(canonical) -> Ok(canonical)
+        Error(_) -> Error(Nil)
+      }
+  }
+  case parsed {
+    Ok([parsed]) -> Ok(parsed.canonical)
+    _ -> Error(Nil)
+  }
 }
 
 fn query_to_trigrams(query: String) -> String {
@@ -523,15 +556,19 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
         h.footer(
           [a.style("padding-top", "10px"), a.style("padding-bottom", "10px")],
           [
-            h.text("This package list is "),
-            h.strong([], [h.text("not maintained by the Gleam team")]),
-            h.text(", it is not official or objective or anything."),
-            h.br([]),
             h.text(
-              "Gleam Lucy starfish mascot © 2026 Louis Pilfold. Thanks also to ",
+              "This includes only Gleam packages that spark joy for me, i.e. not all packages are included. This package list is ",
+            ),
+            h.strong([], [h.text("not maintained by the Gleam team")]),
+            h.text(", it is not official or objective or anything. "),
+            link("https://packages.gleam.run", "packages.gleam.run"),
+            h.text(
+              " Is Gleam's official site for seeing all packages. Thanks also to ",
             ),
             link("https://hex.pm/", "hex.pm"),
-            h.text("."),
+            h.text(" and "),
+            link("https://gloogle.run", "gloogle.run"),
+            h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
             h.br([]),
             h.text("See all packages ordered by: "),
             btn("new", sql.all_pkgs_by_recent),
