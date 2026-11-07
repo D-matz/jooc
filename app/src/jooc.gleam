@@ -67,6 +67,8 @@ type Search {
   NotSearching
 }
 
+const data_src = "https://bucket.correctarity.com/packages.sqlite"
+
 fn init(_) -> #(Model, Effect(Msg)) {
   let query_from_initial_uri = case modem.initial_uri() {
     Ok(initial_uri) ->
@@ -81,8 +83,7 @@ fn init(_) -> #(Model, Effect(Msg)) {
     Error(_) -> None
   }
 
-  let assert Ok(req) =
-    request.to("https://bucket.correctarity.com/packages.sqlite")
+  let assert Ok(req) = request.to(data_src)
   let load_data =
     req
     |> request.set_body(<<>>)
