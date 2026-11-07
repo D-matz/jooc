@@ -23,81 +23,69 @@ pub const info_only = all <> " WHERE instr(lower(p.name), lower(?)) > 0
    OR instr(lower(p.owners), lower(?)) > 0
 ORDER BY p.recent_downloads DESC, p.id"
 
+// params: ?1 text, ?2 trigrams, ?3 similar package names, ?4 bm25 threshold
 pub const code_and_package =
   "WITH pkg AS (
-  SELECT rowid AS id, rank AS score FROM packages_fts
-  WHERE packages_fts MATCH ?2
-    AND rank < ?4
+  SELECT rowid AS id, rank AS score, 999999 AS pos
+  FROM packages_fts
+  WHERE packages_fts MATCH ?2 AND rank < ?4
 
   UNION
 
-  SELECT p.id, 0 AS score
-  FROM packages p
-  WHERE lower(p.name) IN (
-    SELECT lower(value)
-    FROM json_each(?3)
-  )
-),
-exact AS (
-  SELECT rowid AS id FROM modules_fts
-  WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
-  ORDER BY rank
+  SELECT p.id, 0, CAST(j.key AS INTEGER)
+  FROM json_each(?3) j
+  JOIN packages p ON lower(p.name) = lower(j.value)
 ),
 fuzzy AS (
   SELECT rowid AS id FROM modules_fts
   WHERE modules_fts MATCH ?2
     AND rank < -9.0
-    AND rowid NOT IN (SELECT id FROM exact)
+    AND rowid NOT IN (
+      SELECT rowid FROM modules_fts
+      WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
+    )
   ORDER BY rank LIMIT 20
 )
 SELECT name, description, repository, updated_at, owners,
   total_downloads, recent_downloads, latest_version, module, snippet FROM (
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-         p.total_downloads, p.recent_downloads, p.latest_version,
-         NULL AS module, NULL AS snippet,
-         0 AS kind, pkg.score AS score
+    p.total_downloads, p.recent_downloads, p.latest_version,
+    NULL AS module, NULL AS snippet,
+    0 AS kind, pkg.score AS score, pkg.pos AS pos
   FROM pkg
   JOIN packages p ON p.id = pkg.id
+
   UNION ALL
+
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-         p.total_downloads, p.recent_downloads, p.latest_version,
-         m.name,
-         CASE
-           WHEN instr(lower(m.source), lower(?1)) > 0
-           THEN substr(m.source, max(1, instr(lower(m.source), lower(?1)) - 40), 120)
-           ELSE snippet(modules_fts, 1, '', '', '', 64)
-         END,
-         1, f.rank
+    p.total_downloads, p.recent_downloads, p.latest_version,
+    m.name,
+    CASE
+      WHEN instr(lower(m.source), lower(?1)) > 0
+      THEN substr(m.source, max(1, instr(lower(m.source), lower(?1)) - 40), 120)
+      ELSE snippet(modules_fts, 1, '', '', '', 64)
+    END,
+    1, f.rank, 999999
   FROM modules_fts f
   JOIN modules m ON m.id = f.rowid
   JOIN packages p ON p.id = m.package_id
   WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
-    AND f.rowid IN (SELECT id FROM exact)
     AND p.id NOT IN (SELECT id FROM pkg)
+
   UNION ALL
+
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
-         p.total_downloads, p.recent_downloads, p.latest_version,
-         m.name,
-         snippet(modules_fts, 1, '', '', '', 64),
-         2, f.rank
+    p.total_downloads, p.recent_downloads, p.latest_version,
+    m.name,
+    snippet(modules_fts, 1, '', '', '', 64),
+    2, f.rank, 999999
   FROM modules_fts f
   JOIN modules m ON m.id = f.rowid
   JOIN packages p ON p.id = m.package_id
   WHERE modules_fts MATCH ?2 AND f.rowid IN (SELECT id FROM fuzzy)
     AND p.id NOT IN (SELECT id FROM pkg)
 )
-ORDER BY
-  COALESCE(
-    (
-      SELECT CAST(key AS INTEGER)
-      FROM json_each(?3)
-      WHERE lower(value) = lower(name)
-      LIMIT 1
-    ),
-    999999
-  ),
-  kind,
-  score"
+ORDER BY pos, kind, score"
 
 pub const canonical =
   "SELECT
