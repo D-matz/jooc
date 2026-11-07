@@ -1,4 +1,43 @@
-import { Ok, Error } from "./gleam.mjs";
+import { Ok, Error, BitArray } from "./gleam.mjs";
+
+const CACHE_NAME = "sqlite-db";
+const KEY = "/data.sqlite";
+
+export async function check_cached_etag() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const response = await cache.match(KEY);
+    const etag = response?.headers.get("x-etag");
+    return etag ? new Ok(etag) : new Error(undefined);
+  } catch {
+    return new Error(undefined);
+  }
+}
+
+export async function load_cached() {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    const response = await cache.match(KEY);
+    if (!response) return new Error(undefined);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return new Ok(new BitArray(bytes));
+  } catch {
+    return new Error(undefined);
+  }
+}
+
+export async function save_cached(etag, bits) {
+  try {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(
+      KEY,
+      new Response(bits.rawBuffer, { headers: { "x-etag": etag } })
+    );
+    return new Ok(undefined);
+  } catch (e) {
+    return new Error(String(e));
+  }
+}
 
 export async function open(bits) {
   let worker;
