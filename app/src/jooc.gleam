@@ -53,8 +53,9 @@ type Snippet {
 }
 
 type Db {
-  DbLoading
-  DbLoaded(db: sqlite.Database, animation: Animation)
+  DbLoadingFromCache
+  DbLoadingFromServer
+  DbLoaded(db: sqlite.Database, animation: Option(Animation))
   DbError(String)
 }
 
@@ -84,7 +85,14 @@ fn init(_) -> #(Model, Effect(Msg)) {
     Error(_) -> None
   }
   #(
-    Model(DbLoading, [], NotSearching, [], "", query_from_initial_uri),
+    Model(
+      DbLoadingFromCache,
+      [],
+      NotSearching,
+      [],
+      option.unwrap(query_from_initial_uri, ""),
+      query_from_initial_uri,
+    ),
     sqlite.check_cached_etag(CacheReturnedEtag),
   )
 }
@@ -120,25 +128,23 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
           #(model, get_server_etag)
         }
-        Error(_) -> #(model, download_server_db())
+        Error(_) -> download_server_db(model)
       }
-    ServerReturnedEtag(cached_etag, server_response) -> {
-      let effect = case server_response {
-        Error(_) -> download_server_db()
+    ServerReturnedEtag(cached_etag, server_response) ->
+      case server_response {
+        Error(_) -> download_server_db(model)
         Ok(server_response) ->
           case server_response |> response.get_header("etag") {
             Ok(server_etag) ->
               case server_etag == cached_etag {
-                True -> sqlite.load_cached(CacheLoaded)
-                False -> download_server_db()
+                True -> #(model, sqlite.load_cached(CacheLoaded))
+                False -> download_server_db(model)
               }
-            Error(_) -> download_server_db()
+            Error(_) -> download_server_db(model)
           }
       }
-      #(model, effect)
-    }
     CacheLoaded(Ok(cache_data)) -> open_db(model, cache_data)
-    CacheLoaded(Error(_)) -> #(model, download_server_db())
+    CacheLoaded(Error(_)) -> download_server_db(model)
     ServerReturnedData(load_result) ->
       case load_result {
         Ok(resp) -> {
@@ -162,7 +168,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SqliteReturnedOpen(load_result) -> {
       let #(database, exec) = case load_result {
         Ok(db) -> #(
-          DbLoaded(db, Finishing),
+          case model.database {
+            DbLoadingFromCache -> DbLoaded(db, None)
+            DbLoadingFromServer -> DbLoaded(db, Some(Finishing))
+            DbLoaded(_, _) -> panic as "xd"
+            DbError(_) -> panic as "xdd"
+          },
           sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery),
         )
         Error(err) -> #(DbError(err), effect.none())
@@ -173,7 +184,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     SpinFinished -> {
       let model = case model.database {
         DbLoaded(database, _) ->
-          Model(..model, database: DbLoaded(database, Done))
+          Model(..model, database: DbLoaded(database, Some(Done)))
         _ -> model
       }
       #(model, effect.none())
@@ -244,11 +255,14 @@ fn open_db(model: Model, sqlite_db: BitArray) -> #(Model, Effect(Msg)) {
   #(model, sqlite.open(sqlite_db, SqliteReturnedOpen))
 }
 
-fn download_server_db() {
+fn download_server_db(model) {
+  let model = Model(..model, database: DbLoadingFromServer)
   let assert Ok(req) = request.to(data_src)
-  req
-  |> request.set_body(<<>>)
-  |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
+  let download_effect =
+    req
+    |> request.set_body(<<>>)
+    |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
+  #(model, download_effect)
 }
 
 // usually query text is from the user typing, but could also be from initial url
@@ -419,19 +433,35 @@ fn similar_pkg_names(query: String, pkgs: List(String)) {
 // -------------- view ---------------
 
 fn view(model: Model) -> Element(Msg) {
-  let animation = case model.database {
-    DbLoaded(_, animation) -> Some(animation)
-    _ -> None
+  case model.database {
+    DbLoadingFromCache -> element.none()
+    DbLoadingFromServer | DbLoaded(_, _) -> main_view(model)
+    DbError(err) -> h.text(err)
   }
-  let done = animation == Some(Done)
-  let spin_events = case animation {
-    Some(Finishing) -> [on_spin_iteration(SpinFinished)]
+}
+
+fn main_view(model: Model) -> Element(Msg) {
+  let #(done, animated) = case model.database {
+    DbLoaded(_, None) -> #(True, False)
+    DbLoaded(_, Some(Done)) -> #(True, True)
+    _ -> #(False, True)
+  }
+  let spin_events = case model.database {
+    DbLoaded(_, Some(Finishing)) -> [
+      event.on("animationiteration", {
+        use name <- decode.field("animationName", decode.string)
+        case name {
+          "spin" -> decode.success(SpinFinished)
+          _ -> decode.failure(SpinFinished, "spin")
+        }
+      }),
+    ]
     _ -> []
   }
 
   h.div(
     [
-      a.classes([#("done", done)]),
+      a.classes([#("done", done && animated)]),
       a.styles([
         #("--w", "770px"),
         #("box-sizing", "border-box"),
@@ -441,7 +471,7 @@ fn view(model: Model) -> Element(Msg) {
       ]),
     ],
     [
-      view_star(done, spin_events, model),
+      view_star(done, animated, spin_events, model),
       h.input([
         // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
         a.value(model.search_text),
@@ -478,6 +508,7 @@ fn view(model: Model) -> Element(Msg) {
 
 fn view_star(
   done: Bool,
+  animated: Bool,
   spin_events: List(a.Attribute(Msg)),
   model: Model,
 ) -> Element(Msg) {
@@ -513,7 +544,7 @@ fn view_star(
     [
       h.div(
         [
-          a.class("spin"),
+          a.classes([#("spin", animated)]),
           a.styles([
             #("position", "relative"),
             #("width", "100%"),
@@ -534,20 +565,29 @@ fn view_star(
                   _, _ -> "https://gleam.run/images/lucy/lucy.svg"
                 }
             }
-            star_image("normal", svg, "Lucy")
+            star_image(
+              case animated {
+                True -> "normal"
+                False -> ""
+              },
+              svg,
+            )
           },
-          star_image("happy", "https://gleam.run/images/lucy/lucyhappy.svg", ""),
+          case animated {
+            True ->
+              star_image("happy", "https://gleam.run/images/lucy/lucyhappy.svg")
+            False -> element.none()
+          },
         ],
       ),
     ],
   )
 }
 
-fn star_image(name: String, src: String, alt: String) -> Element(Msg) {
+fn star_image(name: String, src: String) -> Element(Msg) {
   h.img([
     a.class(name),
     a.src(src),
-    a.alt(alt),
     a.styles([
       #("position", "absolute"),
       #("width", "100%"),
@@ -561,95 +601,86 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
     // never actually get here we just echo err
     // should probably take it out
     DbError(message) -> h.p([a.style("margin", "0")], [h.text(message)])
-    DbLoaded(_, Done) ->
-      case model.lucy {
-        Searching -> element.none()
-        NotSearching ->
-          h.div([], [
-            case model.search_result {
-              [] ->
-                h.p([a.style("margin", "0")], [
-                  h.text(
-                    "No matching packages found here, but this is not a complete index of all gleam packages. Maybe try ",
-                  ),
-                  link(
-                    "https://packages.gleam.run?search=" <> model.search_text,
-                    "https://packages.gleam.run?search=" <> model.search_text,
-                  ),
-                ])
-              search_results ->
-                h.table(
-                  [
-                    a.styles([
-                      #("width", "100%"),
-                      #("table-layout", "fixed"),
-                      #("border-collapse", "collapse"),
-                    ]),
-                  ],
-                  [
-                    h.colgroup([], [
-                      h.col([a.style("width", "30%")]),
-                      h.col([a.style("width", "20%")]),
-                      h.col([a.style("width", "20%")]),
-                      h.col([a.style("width", "17%")]),
-                      h.col([a.style("width", "13%")]),
-                    ]),
-                    h.thead([], [
-                      h.tr([], [
-                        th("package"),
-                        th("author"),
-                        th("links"),
-                        th("updated"),
-                        th("downloads"),
-                      ]),
-                    ]),
-                    ..list.map(search_results, fn(search_result) {
-                      view_result(search_result, time_ago)
-                    })
-                  ],
-                )
-            },
-            h.footer(
+    DbLoaded(_, None) | DbLoaded(_, Some(Done)) ->
+      // case model.lucy {
+      //   Searching -> element.none()
+      //   NotSearching ->
+      // could make it show nothing as soon as you search, but kind of jarring
+      h.div([], [
+        case model.search_result {
+          [] ->
+            h.p([a.style("margin", "0")], [
+              h.text(
+                "No matching packages found here, but this is not a complete index of all gleam packages. Maybe try ",
+              ),
+              link(
+                "https://packages.gleam.run?search=" <> model.search_text,
+                "https://packages.gleam.run?search=" <> model.search_text,
+              ),
+            ])
+          search_results ->
+            h.table(
               [
-                a.style("padding-top", "10px"),
-                a.style("padding-bottom", "10px"),
+                a.styles([
+                  #("width", "100%"),
+                  #("table-layout", "fixed"),
+                  #("border-collapse", "collapse"),
+                ]),
               ],
               [
-                h.text(
-                  "This includes only Gleam packages that spark joy for me, i.e. not all packages are included. This package list is ",
-                ),
-                h.strong([], [h.text("not maintained by the Gleam team")]),
-                h.text(", it is not official or objective or anything. "),
-                link("https://packages.gleam.run", "packages.gleam.run"),
-                h.text(
-                  " Is Gleam's official site for seeing all packages. Thanks also to ",
-                ),
-                link("https://hex.pm/", "hex.pm"),
-                h.text(" and "),
-                link("https://gloogle.run", "gloogle.run"),
-                h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
-                h.br([]),
-                h.text("See all packages ordered by: "),
-                btn("new", sql.all_pkgs_by_recent),
-                btn("popular", sql.all_pkgs_by_downloaded),
-                btn("big", sql.all_pkgs_by_big),
-                btn("small", sql.all_pkgs_by_small),
+                h.colgroup([], [
+                  h.col([a.style("width", "30%")]),
+                  h.col([a.style("width", "20%")]),
+                  h.col([a.style("width", "20%")]),
+                  h.col([a.style("width", "17%")]),
+                  h.col([a.style("width", "13%")]),
+                ]),
+                h.thead([], [
+                  h.tr([], [
+                    th("package"),
+                    th("author"),
+                    th("links"),
+                    th("updated"),
+                    th("downloads"),
+                  ]),
+                ]),
+                ..list.map(search_results, fn(search_result) {
+                  view_result(search_result, time_ago)
+                })
               ],
+            )
+        },
+        h.footer(
+          [
+            a.style("padding-top", "10px"),
+            a.style("padding-bottom", "10px"),
+          ],
+          [
+            h.text(
+              "This includes only Gleam packages that spark joy for me, i.e. not all packages are included. This package list is ",
             ),
-          ])
-      }
+            h.strong([], [h.text("not maintained by the Gleam team")]),
+            h.text(", it is not official or objective or anything. "),
+            link("https://packages.gleam.run", "packages.gleam.run"),
+            h.text(
+              " Is Gleam's official site for seeing all packages. Thanks also to ",
+            ),
+            link("https://hex.pm/", "hex.pm"),
+            h.text(" and "),
+            link("https://gloogle.run", "gloogle.run"),
+            h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
+            h.br([]),
+            h.text("See all packages ordered by: "),
+            btn("new", sql.all_pkgs_by_recent),
+            btn("popular", sql.all_pkgs_by_downloaded),
+            btn("big", sql.all_pkgs_by_big),
+            btn("small", sql.all_pkgs_by_small),
+          ],
+        ),
+      ])
+    // }
     _ -> element.none()
   }
-}
-
-fn on_spin_iteration(msg: Msg) -> a.Attribute(Msg) {
-  event.on("animationiteration", {
-    use name <- decode.field("animationName", decode.string)
-    case name {
-      "spin" -> decode.success(msg)
-      _ -> decode.failure(msg, "spin")
-    }
-  })
 }
 
 fn view_result(
