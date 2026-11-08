@@ -26,7 +26,7 @@ import gleam/time/timestamp.{type Timestamp}
 import sqlight
 import star
 
-const db_path = "packages.db"
+const db_path = "packages.sqlite"
 
 const already_read_url = "https://bucket.correctarity.com/already_read.json"
 
