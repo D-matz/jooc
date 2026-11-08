@@ -45,11 +45,16 @@ type Model {
 }
 
 type SearchResult {
-  SearchResult(package: storage.Package, snippet: List(Snippet))
+  SearchResult(package: storage.Package, snippet: List(ModuleSnippet))
+}
+
+type ModuleSnippet {
+  ModuleSnippet(module_name: String, snippet: Snippet)
 }
 
 type Snippet {
-  Snippet(module_name: String, code: List(String))
+  FuzzyMatch(before: String, match: String, after: String)
+  Canonical(definitions: List(String))
 }
 
 type Db {
@@ -108,6 +113,7 @@ type Msg {
   SqliteReturnedOpen(Result(sqlite.Database, String))
   SpinFinished
   SqliteReturnedQuery(Result(Dynamic, String))
+  SqliteReturnedQueryCanonical(Result(Dynamic, String))
   UserTypedQuery(String)
   UserClickedButton(String)
 }
@@ -189,54 +195,19 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(model, effect.none())
     }
-    SqliteReturnedQuery(query_result) -> {
-      let query_resp =
-        case query_result {
-          Ok(query_resp) -> {
-            let resp = decode.run(query_resp, trigram_snippet_decoder())
-            case resp {
-              Ok(resp) -> {
-                resp
-              }
-              Error(err) -> {
-                echo err
-                []
-              }
-            }
-          }
-          Error(err) -> {
-            echo err
-            []
-          }
-        }
-        |> merge_modules_by_package
-      // the first time we run this will be empty and on loading it gets all packages
-      // so we fill out name list so we can do levenshtein edit distance on package names in gleam
-      // as fts5 trigrams doesnt seem great for eg luster -> lustre
-      // also first time we get response, run user's initial query from url...
-      // can't just run it immediately because we need to load package names first here
-      // the pkg name list kind of doing double duty to indicate we ready for user url query, kind of confusing
+    SqliteReturnedQuery(query_result) ->
+      handle_query_result(
+        model,
+        query_result,
+        decode.list(search_result_decoder(model.search_text)),
+      )
 
-      case model.all_pkg_names {
-        [] -> {
-          let all_pkg_names = list.map(query_resp, fn(pkg) { pkg.package.name })
-          let model = Model(..model, all_pkg_names:)
-          case model.query_from_initial_uri {
-            Some(text) -> text_to_query(text, model)
-            None -> {
-              let model =
-                Model(..model, search_result: query_resp, lucy: NotSearching)
-              #(model, effect.none())
-            }
-          }
-        }
-        _ -> {
-          let model =
-            Model(..model, search_result: query_resp, lucy: NotSearching)
-          #(model, effect.none())
-        }
-      }
-    }
+    SqliteReturnedQueryCanonical(query_result) ->
+      handle_query_result(
+        model,
+        query_result,
+        decode.list(canonical_result_decoder()),
+      )
     UserTypedQuery(text) -> text_to_query(text, model)
     UserClickedButton(premade_query) -> {
       let exec = case model.database {
@@ -247,6 +218,55 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       let model = Model(..model, lucy: Searching, search_text: "")
       #(model, exec)
+    }
+  }
+}
+
+fn handle_query_result(
+  model: Model,
+  query_result: Result(Dynamic, String),
+  decoder: decode.Decoder(List(Result(SearchResult, Nil))),
+) -> #(Model, Effect(Msg)) {
+  let query_resp =
+    case query_result {
+      Ok(query_resp) ->
+        case decode.run(query_resp, decoder) {
+          Ok(resp) -> resp
+          Error(err) -> {
+            echo err
+            []
+          }
+        }
+      Error(err) -> {
+        echo err
+        []
+      }
+    }
+    |> result.values
+    |> merge_modules_by_package
+  // the first time we run this will be empty and on loading it gets all packages
+  // so we fill out name list so we can do levenshtein edit distance on package names in gleam
+  // as fts5 trigrams doesnt seem great for eg luster -> lustre
+  // also first time we get response, run user's initial query from url...
+  // can't just run it immediately because we need to load package names first here
+  // the pkg name list kind of doing double duty to indicate we ready for user url query, kind of confusing
+
+  case model.all_pkg_names {
+    [] -> {
+      let all_pkg_names = list.map(query_resp, fn(pkg) { pkg.package.name })
+      let model = Model(..model, all_pkg_names:)
+      case model.query_from_initial_uri {
+        Some(text) -> text_to_query(text, model)
+        None -> {
+          let model =
+            Model(..model, search_result: query_resp, lucy: NotSearching)
+          #(model, effect.none())
+        }
+      }
+    }
+    _ -> {
+      let model = Model(..model, search_result: query_resp, lucy: NotSearching)
+      #(model, effect.none())
     }
   }
 }
@@ -285,7 +305,12 @@ fn text_to_query(text, model) {
         [_, _, ..] -> {
           case parse_type_or_fn(chars) {
             Ok(canonical) ->
-              sqlite.query(db, sql.canonical, [canonical], SqliteReturnedQuery)
+              sqlite.query(
+                db,
+                sql.canonical,
+                [canonical],
+                SqliteReturnedQueryCanonical,
+              )
             Error(_) -> {
               let trigram_count = string.length(text) - 4
               let bm25_threshold = int.to_string(-6 * trigram_count)
@@ -358,11 +383,9 @@ fn query_to_trigrams(query: String) -> String {
   |> string.join(" OR ")
 }
 
-fn trigram_snippet_decoder() {
-  decode.list(search_result_decoder())
-}
-
-fn search_result_decoder() -> decode.Decoder(SearchResult) {
+fn search_result_decoder(
+  search_text: String,
+) -> decode.Decoder(Result(SearchResult, Nil)) {
   use name <- decode.field(0, decode.string)
   use description <- decode.field(1, decode.string)
   use repository <- decode.field(2, decode.optional(decode.string))
@@ -373,12 +396,8 @@ fn search_result_decoder() -> decode.Decoder(SearchResult) {
   use latest_version <- decode.field(7, decode.string)
   use module_name <- decode.field(8, decode.optional(decode.string))
   use code <- decode.field(9, decode.optional(decode.string))
-  let snippet = case module_name, code {
-    Some(module_name), Some(code) -> [Snippet(module_name:, code: [code])]
-    _, _ -> []
-  }
-  decode.success(SearchResult(
-    package: storage.Package(
+  let package =
+    storage.Package(
       name:,
       description:,
       repository:,
@@ -387,9 +406,82 @@ fn search_result_decoder() -> decode.Decoder(SearchResult) {
       total_downloads:,
       recent_downloads:,
       latest_version:,
-    ),
-    snippet:,
-  ))
+    )
+  case module_name, code {
+    Some(module_name), Some(code) ->
+      case parse_code(code, search_text) {
+        Ok(match) ->
+          decode.success(
+            Ok(
+              SearchResult(package:, snippet: [
+                ModuleSnippet(module_name, match),
+              ]),
+            ),
+          )
+        Error(_) -> decode.success(Error(Nil))
+      }
+    _, _ -> decode.success(Ok(SearchResult(package:, snippet: [])))
+  }
+}
+
+fn parse_code(code: String, search_text: String) -> Result(Snippet, Nil) {
+  let acceptable_distance = case string.length(search_text) {
+    n if n <= 4 -> 0
+    n if n <= 12 -> 1
+    n if n <= 14 -> 2
+    n if n <= 20 -> 3
+    n if n <= 50 -> 4
+    _ -> 5
+  }
+  parse_code_loop("", code, string.lowercase(search_text), acceptable_distance)
+}
+
+fn parse_code_loop(
+  seen: String,
+  rest: String,
+  search_text: String,
+  acceptable_distance: Int,
+) -> Result(Snippet, Nil) {
+  use #(before, rest) <- result.try(string.split_once(rest, "\u{2}"))
+  let seen = seen <> string.replace(before, "\u{3}", "")
+  let text = rest |> string.replace("\u{2}", "") |> string.replace("\u{3}", "")
+  let match = string.slice(text, 0, string.length(search_text))
+  case edit_distance.levenshtein(string.lowercase(match), search_text) {
+    d if d <= acceptable_distance ->
+      Ok(FuzzyMatch(seen, match, string.drop_start(text, string.length(match))))
+    _ -> parse_code_loop(seen, rest, search_text, acceptable_distance)
+  }
+}
+
+fn canonical_result_decoder() -> decode.Decoder(Result(SearchResult, Nil)) {
+  use name <- decode.field(0, decode.string)
+  use description <- decode.field(1, decode.string)
+  use repository <- decode.field(2, decode.optional(decode.string))
+  use updated_at <- decode.field(3, decode.int)
+  use owners <- decode.field(4, decode.string)
+  use total_downloads <- decode.field(5, decode.int)
+  use recent_downloads <- decode.field(6, decode.int)
+  use latest_version <- decode.field(7, decode.string)
+  use module_name <- decode.field(8, decode.optional(decode.string))
+  use code <- decode.field(9, decode.optional(decode.string))
+  let package =
+    storage.Package(
+      name:,
+      description:,
+      repository:,
+      updated_at: timestamp.from_unix_seconds(updated_at),
+      owners: owners |> string.split(" ") |> list.filter(fn(o) { o != "" }),
+      total_downloads:,
+      recent_downloads:,
+      latest_version:,
+    )
+  let snippet = case module_name, code {
+    Some(module_name), Some(code) -> [
+      ModuleSnippet(module_name, Canonical([code])),
+    ]
+    _, _ -> []
+  }
+  decode.success(Ok(SearchResult(package:, snippet:)))
 }
 
 fn merge_modules_by_package(results: List(SearchResult)) -> List(SearchResult) {
@@ -400,15 +492,7 @@ fn merge_modules_by_package(results: List(SearchResult)) -> List(SearchResult) {
   |> list.filter_map(fn(name) {
     use group <- result.try(dict.get(groups, name))
     use first <- result.map(list.first(group))
-    let snippet =
-      group
-      |> list.flat_map(fn(r) { r.snippet })
-      |> list.group(fn(s) { s.module_name })
-      |> dict.map_values(fn(name, same) {
-        Snippet(name, list.flat_map(same, fn(s) { s.code }))
-      })
-      |> dict.values
-    SearchResult(..first, snippet: snippet)
+    SearchResult(..first, snippet: list.flat_map(group, fn(r) { r.snippet }))
   })
 }
 
@@ -743,28 +827,40 @@ fn view_result(
   ])
 }
 
-fn code_snippet(snippet: Snippet) -> Element(msg) {
+fn code_snippet(snippet: ModuleSnippet) -> Element(msg) {
   h.div([a.styles([#("margin", "0.75rem 0 0.75rem 1rem")])], [
     h.p([a.styles([#("margin", "0 0 0.25rem"), #("font-weight", "600")])], [
       h.text(snippet.module_name),
     ]),
-    ..list.map(snippet.code, fn(source) {
-      h.pre(
-        [
-          a.styles([
-            #("margin", "0"),
-            #("margin-bottom", "0.5rem"),
-            #("padding", "0.5rem 0.75rem"),
-            #("background", "rgba(128, 128, 128, 0.15)"),
-            #("border-radius", "0.3rem"),
-            #("white-space", "pre-wrap"),
-            #("overflow-x", "auto"),
-          ]),
-        ],
-        [h.code([], [h.text(source)])],
-      )
-    })
+    ..case snippet.snippet {
+      FuzzyMatch(before:, match:, after:) -> [
+        code_block([
+          h.text(before),
+          h.mark([a.style("background-color", "#ffaff3")], [h.text(match)]),
+          h.text(after),
+        ]),
+      ]
+      Canonical(definitions:) ->
+        list.map(definitions, fn(source) { code_block([h.text(source)]) })
+    }
   ])
+}
+
+fn code_block(elts) {
+  h.pre(
+    [
+      a.styles([
+        #("margin", "0"),
+        #("margin-bottom", "0.5rem"),
+        #("padding", "0.5rem 0.75rem"),
+        #("background", "rgba(128, 128, 128, 0.15)"),
+        #("border-radius", "0.3rem"),
+        #("white-space", "pre-wrap"),
+        #("overflow-x", "auto"),
+      ]),
+    ],
+    [h.code([], elts)],
+  )
 }
 
 fn th(label: String) -> Element(msg) {

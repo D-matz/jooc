@@ -39,12 +39,12 @@ pub const code_and_package =
 fuzzy AS (
   SELECT rowid AS id FROM modules_fts
   WHERE modules_fts MATCH ?2
-    AND rank < -9.0
+    AND rank < -5.0
+    AND length(source) < 200000
     AND rowid NOT IN (
       SELECT rowid FROM modules_fts
       WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
     )
-  ORDER BY rank LIMIT 20
 )
 SELECT name, description, repository, updated_at, owners,
   total_downloads, recent_downloads, latest_version, module, snippet FROM (
@@ -60,11 +60,7 @@ SELECT name, description, repository, updated_at, owners,
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
     p.total_downloads, p.recent_downloads, p.latest_version,
     m.name,
-    CASE
-      WHEN instr(lower(m.source), lower(?1)) > 0
-      THEN substr(m.source, max(1, instr(lower(m.source), lower(?1)) - 40), 120)
-      ELSE snippet(modules_fts, 1, '', '', '', 64)
-    END,
+    snippet(modules_fts, 1, char(2), char(3), '', 64),
     1, f.rank, 999999
   FROM modules_fts f
   JOIN modules m ON m.id = f.rowid
@@ -77,7 +73,7 @@ SELECT name, description, repository, updated_at, owners,
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
     p.total_downloads, p.recent_downloads, p.latest_version,
     m.name,
-    snippet(modules_fts, 1, '', '', '', 64),
+    snippet(modules_fts, 1, char(2), char(3), '', 64),
     2, f.rank, 999999
   FROM modules_fts f
   JOIN modules m ON m.id = f.rowid
@@ -92,10 +88,10 @@ pub const canonical =
   p.name, p.description, p.repository, p.updated_at, p.owners,
   p.total_downloads, p.recent_downloads, p.latest_version,
   m.name AS module,
-  CAST(
+  char(2) || CAST(
     substr(CAST(m.source AS BLOB), d.start_pos + 1, d.end_pos - d.start_pos)
     AS TEXT
-  ) AS snippet
+  ) || char(3) AS snippet
 FROM canonical_forms c
 JOIN definitions d ON d.canonical_id = c.id
 JOIN modules m ON m.id = d.module_id
