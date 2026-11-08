@@ -39,7 +39,7 @@ pub const code_and_package =
 fuzzy AS (
   SELECT rowid AS id FROM modules_fts
   WHERE modules_fts MATCH ?2
-    AND rank < -5.0
+    AND rank < ?4
     AND length(source) < 200000
     AND rowid NOT IN (
       SELECT rowid FROM modules_fts

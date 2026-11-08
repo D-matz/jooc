@@ -3,6 +3,7 @@ import edit_distance
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+import gleam/float
 import gleam/http
 import gleam/http/request
 import gleam/http/response.{type Response}
@@ -112,10 +113,18 @@ type Msg {
   ServerReturnedData(Result(Response(BitArray), rsvp.Error(BitArray)))
   SqliteReturnedOpen(Result(sqlite.Database, String))
   SpinFinished
-  SqliteReturnedQuery(Result(Dynamic, String))
-  SqliteReturnedQueryCanonical(Result(Dynamic, String))
+  SqliteReturnedQuery(
+    query_was: Query,
+    search_text_was: String,
+    got: Result(Dynamic, String),
+  )
   UserTypedQuery(String)
   UserClickedButton(String)
+}
+
+type Query {
+  QueryFuzzy
+  QueryCanonical
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -180,7 +189,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             DbLoaded(_, _) -> panic as "xd"
             DbError(_) -> panic as "xdd"
           },
-          sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery),
+          sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
+            QueryCanonical,
+            model.search_text,
+            _,
+          )),
         )
         Error(err) -> #(DbError(err), effect.none())
       }
@@ -195,24 +208,27 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
       #(model, effect.none())
     }
-    SqliteReturnedQuery(query_result) ->
-      handle_query_result(
-        model,
-        query_result,
-        decode.list(search_result_decoder(model.search_text)),
-      )
-
-    SqliteReturnedQueryCanonical(query_result) ->
-      handle_query_result(
-        model,
-        query_result,
-        decode.list(canonical_result_decoder()),
-      )
+    SqliteReturnedQuery(query_was, search_text_was, got) -> {
+      case search_text_was == model.search_text {
+        False -> #(model, effect.none())
+        True -> {
+          let decoder = case query_was {
+            QueryFuzzy -> decode.list(search_result_decoder(search_text_was))
+            QueryCanonical -> decode.list(canonical_result_decoder())
+          }
+          handle_query_result(model, got, decoder)
+        }
+      }
+    }
     UserTypedQuery(text) -> text_to_query(text, model)
     UserClickedButton(premade_query) -> {
       let exec = case model.database {
         DbLoaded(db, _) -> {
-          sqlite.query(db, premade_query, [], SqliteReturnedQuery)
+          sqlite.query(db, premade_query, [], SqliteReturnedQuery(
+            QueryFuzzy,
+            "",
+            _,
+          ))
         }
         _ -> effect.none()
       }
@@ -294,26 +310,31 @@ fn text_to_query(text, model) {
     DbLoaded(db, _) -> {
       let chars = string.to_graphemes(text)
       case chars {
-        [] -> sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery)
+        [] ->
+          sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
+            QueryFuzzy,
+            model.search_text,
+            _,
+          ))
         [_] | [_, _] ->
           sqlite.query(
             db,
             sql.info_only,
             [text, text, text],
-            SqliteReturnedQuery,
+            SqliteReturnedQuery(QueryFuzzy, model.search_text, _),
           )
         [_, _, ..] -> {
           case parse_type_or_fn(chars) {
             Ok(canonical) ->
-              sqlite.query(
-                db,
-                sql.canonical,
-                [canonical],
-                SqliteReturnedQueryCanonical,
-              )
+              sqlite.query(db, sql.canonical, [canonical], SqliteReturnedQuery(
+                QueryCanonical,
+                model.search_text,
+                _,
+              ))
             Error(_) -> {
-              let trigram_count = string.length(text) - 4
-              let bm25_threshold = int.to_string(-6 * trigram_count)
+              let bm25_threshold = text |> string.length |> int.to_float
+              let bm25_threshold =
+                float.to_string({ -0.75 *. bm25_threshold } -. 4.0)
               sqlite.query(
                 db,
                 sql.code_and_package,
@@ -326,7 +347,7 @@ fn text_to_query(text, model) {
                     |> json.to_string,
                   bm25_threshold,
                 ],
-                SqliteReturnedQuery,
+                SqliteReturnedQuery(QueryFuzzy, model.search_text, _),
               )
             }
           }
