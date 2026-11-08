@@ -96,7 +96,7 @@ fn canonical_function(function: glance.Function) -> String {
 }
 
 // Canonical form of a function signature. None means no type annotation.
-fn canonical_signature(
+pub fn canonical_signature(
   param_types: List(Option(glance.Type)),
   return_type: Option(glance.Type),
 ) -> String {

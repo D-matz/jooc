@@ -2,9 +2,11 @@
 //// modules and the canonical forms of their types and functions to a SQLite db.
 ////
 //// Create the db first: sqlite3 packages.db < schema.sql
-//// Dependencies: gleam_stdlib, glance, gleam_json, gleam_package_interface,
-////               gleam_http, gleam_httpc, gleam_time, star, sqlight
+//// Dependencies: gleam_stdlib, glance, girard, gleam_json,
+////               gleam_package_interface, gleam_http, gleam_httpc, gleam_time,
+////               star, sqlight
 
+import canonical
 import glance
 import gleam/bit_array
 import gleam/dict.{type Dict}
@@ -94,12 +96,6 @@ fn unix_seconds(time: Timestamp) -> Int {
   time |> timestamp.to_unix_seconds |> float.round
 }
 
-/// One definition in a module.
-/// kind: 0 = custom type, 1 = function
-type Entry {
-  Entry(kind: Int, canonical: String, start_pos: Int, end_pos: Int)
-}
-
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -180,7 +176,7 @@ fn add_package(package: Package) -> Result(Int, String) {
       let module_path = path |> string.drop_start(4) |> string.drop_end(6)
       let signatures = interface_signatures(interface, module_path)
       use entries <- result.try(
-        canonical_all(source, signatures)
+        module_entries(source, signatures)
         |> result.map_error(string.inspect),
       )
       Ok(#(module_path, source, entries))
@@ -268,7 +264,7 @@ fn is_current(package: Package) -> Result(Bool, sqlight.Error) {
 fn store_package(
   conn: sqlight.Connection,
   package: Package,
-  modules: List(#(String, String, List(Entry))),
+  modules: List(#(String, String, List(canonical.Entry))),
 ) -> Result(Int, sqlight.Error) {
   // Foreign keys must be on, so that deletes cascade.
   use _ <- result.try(sqlight.exec("PRAGMA foreign_keys = ON", conn))
@@ -285,7 +281,7 @@ fn store_package(
 fn store_all(
   conn: sqlight.Connection,
   package: Package,
-  modules: List(#(String, String, List(Entry))),
+  modules: List(#(String, String, List(canonical.Entry))),
 ) -> Result(Int, sqlight.Error) {
   // A new updated_at makes a trigger delete the old modules.
   use package_id <- result.try(upsert_package(conn, package))
@@ -326,7 +322,7 @@ fn store_module(
   package_id: Int,
   name: String,
   source: String,
-  entries: List(Entry),
+  entries: List(canonical.Entry),
 ) -> Result(Int, sqlight.Error) {
   use ids <- result.try(sqlight.query(
     insert_module,
@@ -391,7 +387,7 @@ fn interface_signature(function: package_interface.Function) -> String {
     list.map(function.parameters, fn(parameter) {
       Some(convert(parameter.type_))
     })
-  canonical_signature(param_types, Some(convert(function.return)))
+  canonical.canonical_signature(param_types, Some(convert(function.return)))
 }
 
 // Convert an interface type to a glance type, so that one renderer is used
@@ -420,205 +416,62 @@ fn convert(type_: package_interface.Type) -> glance.Type {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical forms
+// Entries: interface forms first, canonical.parse only when needed
 // ---------------------------------------------------------------------------
 
-// Parse `source` and return an entry for each custom type and each function.
-// `signatures` maps function names to forms from the package interface.
-// Pass dict.new() to use only the annotations in the source.
-//
-// type Abc{ Abc1(a: Int, b: Int) Abc2(a: String, b: Int) }
-// type Xyz{ Xyz1(x: Int, y: String) Xyz2(x: Int, y: Int) }
-//   both give "0:[[Int,Int],[Int,String]]"
-//
-// fn add(a: Int, b: Int) -> Int          gives "fn:[Int,Int]->Int"
-// fn map(l: List(a), f: fn(a) -> b) -> List(b)
-//                                        gives "fn:[List($0),fn($0)->$1]->List($1)"
-fn canonical_all(
+// canonical.parse is needed for custom types and for functions that the
+// interface does not have (private functions). When the module has none of
+// these, the entries come from the interface alone.
+fn module_entries(
   source: String,
   signatures: Dict(String, String),
-) -> Result(List(Entry), glance.Error) {
+) -> Result(List(canonical.Entry), glance.Error) {
   use parsed <- result.try(glance.module(source))
-  let types =
-    list.map(parsed.custom_types, fn(definition) {
-      let custom_type = definition.definition
-      Entry(
-        kind: 0,
-        canonical: canonical_type(custom_type),
-        start_pos: custom_type.location.start,
-        end_pos: custom_type.location.end,
+  let all_in_interface =
+    list.all(parsed.functions, fn(definition) {
+      dict.has_key(signatures, definition.definition.name)
+    })
+  case parsed.custom_types, all_in_interface {
+    [], True ->
+      Ok(
+        list.map(parsed.functions, fn(definition) {
+          let function = definition.definition
+          canonical.Entry(
+            kind: 1,
+            canonical: dict.get(signatures, function.name)
+              |> result.unwrap(""),
+            start_pos: function.location.start,
+            end_pos: function.location.end,
+          )
+        }),
       )
-    })
-  let functions =
-    list.map(parsed.functions, fn(definition) {
-      let function = definition.definition
-      Entry(
-        kind: 1,
-        // Use the form from the package interface when it has this function.
-        canonical: case dict.get(signatures, function.name) {
-          Ok(form) -> form
-          Error(_) -> canonical_function(function)
-        },
-        start_pos: function.location.start,
-        end_pos: function.location.end,
-      )
-    })
-  Ok(list.append(types, functions))
+    _, _ ->
+      canonical.parse(source)
+      |> result.map(with_signatures(_, parsed, signatures))
+  }
 }
 
-fn canonical_type(custom_type: glance.CustomType) -> String {
-  let arity = list.length(custom_type.parameters)
-  // Try every order of the type parameters. Keep the smallest result.
-  let body =
-    custom_type.parameters
-    |> list.permutations
-    |> list.map(fn(names) {
-      render_variants(custom_type.variants, number_parameters(names))
-    })
-    |> list.sort(string.compare)
-    |> list.first
-    |> result.unwrap("")
-  int.to_string(arity) <> ":" <> body
-}
-
-fn canonical_function(function: glance.Function) -> String {
-  let param_types =
-    list.map(function.parameters, fn(parameter) { parameter.type_ })
-  canonical_signature(param_types, function.return)
-}
-
-// Canonical form of a function signature. None means no type annotation.
-fn canonical_signature(
-  param_types: List(Option(glance.Type)),
-  return_type: Option(glance.Type),
-) -> String {
-  // A function has no list of type variables. Collect them from the signature.
+// Replace the form of each function that has an interface form.
+// An entry is matched to its function by start position.
+fn with_signatures(
+  entries: List(canonical.Entry),
+  parsed: glance.Module,
+  signatures: Dict(String, String),
+) -> List(canonical.Entry) {
   let names =
-    list.append(
-      list.flat_map(param_types, option_variables),
-      option_variables(return_type),
-    )
-    |> list.unique
-  // Try every order of the type variables. Keep the smallest result.
-  let body =
-    names
-    |> list.permutations
-    |> list.map(fn(order) {
-      render_function(param_types, return_type, number_parameters(order))
+    parsed.functions
+    |> list.map(fn(definition) {
+      #(definition.definition.location.start, definition.definition.name)
     })
-    |> list.sort(string.compare)
-    |> list.first
-    |> result.unwrap("")
-  "fn:" <> body
-}
-
-// Parameter names and labels are dropped. Parameter types are sorted.
-// To keep the parameter order, remove the list.sort call.
-fn render_function(
-  param_types: List(Option(glance.Type)),
-  return_type: Option(glance.Type),
-  params: Dict(String, Int),
-) -> String {
-  let rendered =
-    param_types
-    |> list.map(render_option(_, params))
-    |> list.sort(string.compare)
-  "["
-  <> string.join(rendered, ",")
-  <> "]->"
-  <> render_option(return_type, params)
-}
-
-// A missing type annotation gives "_".
-fn render_option(
-  type_: Option(glance.Type),
-  params: Dict(String, Int),
-) -> String {
-  case type_ {
-    Some(type_) -> render_type(type_, params)
-    None -> "_"
-  }
-}
-
-fn option_variables(type_: Option(glance.Type)) -> List(String) {
-  case type_ {
-    Some(type_) -> type_variables(type_)
-    None -> []
-  }
-}
-
-fn type_variables(type_: glance.Type) -> List(String) {
-  case type_ {
-    glance.NamedType(parameters: args, ..) ->
-      list.flat_map(args, type_variables)
-    glance.TupleType(elements: elements, ..) ->
-      list.flat_map(elements, type_variables)
-    glance.FunctionType(parameters: args, return: return, ..) ->
-      list.append(list.flat_map(args, type_variables), type_variables(return))
-    glance.VariableType(name: name, ..) -> [name]
-    glance.HoleType(..) -> []
-  }
-}
-
-fn number_parameters(names: List(String)) -> Dict(String, Int) {
-  names
-  |> list.index_map(fn(name, index) { #(name, index) })
-  |> dict.from_list
-}
-
-fn render_variants(
-  variants: List(glance.Variant),
-  params: Dict(String, Int),
-) -> String {
-  let rendered =
-    variants
-    |> list.map(render_variant(_, params))
-    |> list.sort(string.compare)
-  "[" <> string.join(rendered, ",") <> "]"
-}
-
-// Variant names and field labels are dropped. Field types are sorted.
-fn render_variant(
-  variant: glance.Variant,
-  params: Dict(String, Int),
-) -> String {
-  let fields =
-    variant.fields
-    |> list.map(fn(field) { render_type(field_type(field), params) })
-    |> list.sort(string.compare)
-  "[" <> string.join(fields, ",") <> "]"
-}
-
-fn field_type(field: glance.VariantField) -> glance.Type {
-  case field {
-    glance.LabelledVariantField(item: item, ..) -> item
-    glance.UnlabelledVariantField(item: item) -> item
-  }
-}
-
-fn render_type(type_: glance.Type, params: Dict(String, Int)) -> String {
-  case type_ {
-    // The module qualifier is ignored on purpose.
-    glance.NamedType(name: name, parameters: args, ..) ->
-      case args {
-        [] -> name
-        _ -> name <> "(" <> render_list(args, params) <> ")"
-      }
-    glance.TupleType(elements: elements, ..) ->
-      "#(" <> render_list(elements, params) <> ")"
-    glance.FunctionType(parameters: args, return: return, ..) ->
-      "fn(" <> render_list(args, params) <> ")->" <> render_type(return, params)
-    glance.VariableType(name: name, ..) ->
-      case dict.get(params, name) {
-        Ok(number) -> "$" <> int.to_string(number)
-        Error(_) -> "$" <> name
-      }
-    glance.HoleType(..) -> "_"
-  }
-}
-
-fn render_list(types: List(glance.Type), params: Dict(String, Int)) -> String {
-  types
-  |> list.map(render_type(_, params))
-  |> string.join(",")
+    |> dict.from_list
+  list.map(entries, fn(entry) {
+    let form = case entry.kind, dict.get(names, entry.start_pos) {
+      1, Ok(name) -> dict.get(signatures, name)
+      _, _ -> Error(Nil)
+    }
+    case form {
+      Ok(form) -> canonical.Entry(..entry, canonical: form)
+      Error(_) -> entry
+    }
+  })
 }
