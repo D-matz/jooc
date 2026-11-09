@@ -332,9 +332,9 @@ fn text_to_query(text, model) {
                 _,
               ))
             Error(_) -> {
-              let bm25_threshold = text |> string.length |> int.to_float
+              let bm25_threshold = text |> string.length
               let bm25_threshold =
-                float.to_string({ -0.75 *. bm25_threshold } -. 4.0)
+                float.to_string(8.0 -. { int.to_float(bm25_threshold) *. 1.5 })
               sqlite.query(
                 db,
                 sql.code_and_package,
@@ -441,15 +441,43 @@ fn search_result_decoder(
           )
         Error(_) -> decode.success(Error(Nil))
       }
-    _, _ -> decode.success(Ok(SearchResult(package:, snippet: [])))
+    _, _ -> {
+      let search = string.lowercase(search_text)
+      let acceptable_distance = case string.length(search_text) {
+        n if n <= 4 -> 1
+        n if n <= 9 -> 2
+        n if n <= 13 -> 3
+        n if n <= 20 -> 4
+        n if n <= 50 -> 5
+        _ -> 6
+      }
+      let matches =
+        similar_pkg_names(search_text, [name]) != []
+        || list.any([name, owners, description], fn(field) {
+          fuzzy_contains(string.lowercase(field), search, acceptable_distance)
+        })
+      case matches {
+        True -> decode.success(Ok(SearchResult(package:, snippet: [])))
+        False -> decode.success(Error(Nil))
+      }
+    }
+  }
+}
+
+fn fuzzy_contains(text: String, search: String, distance: Int) -> Bool {
+  let window = string.slice(text, 0, string.length(search))
+  edit_distance.levenshtein(window, search) <= distance
+  || case text {
+    "" -> False
+    _ -> fuzzy_contains(string.drop_start(text, 1), search, distance)
   }
 }
 
 fn parse_code(code: String, search_text: String) -> Result(Snippet, Nil) {
   let acceptable_distance = case string.length(search_text) {
     n if n <= 4 -> 0
-    n if n <= 12 -> 1
-    n if n <= 14 -> 2
+    n if n <= 9 -> 1
+    n if n <= 13 -> 2
     n if n <= 20 -> 3
     n if n <= 50 -> 4
     _ -> 5
@@ -466,8 +494,22 @@ fn parse_code_loop(
   use #(before, rest) <- result.try(string.split_once(rest, "\u{2}"))
   let seen = seen <> string.replace(before, "\u{3}", "")
   let text = rest |> string.replace("\u{2}", "") |> string.replace("\u{3}", "")
-  let match = string.slice(text, 0, string.length(search_text))
-  case edit_distance.levenshtein(string.lowercase(match), search_text) {
+  let len = string.length(search_text)
+  let #(match, distance) =
+    int.range(
+      int.max(len - acceptable_distance, 1),
+      len + acceptable_distance + 1,
+      #("", 999),
+      fn(best, l) {
+        let m = string.slice(text, 0, l)
+        let d = edit_distance.levenshtein(string.lowercase(m), search_text)
+        case d <= best.1 {
+          True -> #(m, d)
+          False -> best
+        }
+      },
+    )
+  case distance {
     d if d <= acceptable_distance ->
       Ok(FuzzyMatch(seen, match, string.drop_start(text, string.length(match))))
     _ -> parse_code_loop(seen, rest, search_text, acceptable_distance)
