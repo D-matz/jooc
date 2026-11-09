@@ -21,5 +21,17 @@ modem = ">= 2.1.3 and < 3.0.0"
 gleeunit = ">= 1.0.0 and < 2.0.0"
 
 [tools.lustre.html]
-scripts = [{ src = "/sqlite3-worker1-promiser.js" }]
-stylesheets = [{ href = "/jooc.css" }]
+scripts = [{ src = "/static/jooc/sqlite3-worker1-promiser.js" }]
+stylesheets = [{ href = "/static/jooc/jooc.css" }]
+title = "Gleam packages that spark joy"
+meta = [
+  { name = "description", content = "Filtered list of Gleam packages. Search by name, code, type, or function" },
+  { name = "keywords", content = "Gleam, package, search, type, function, code, spark, joy" },
+  { property = "og:title", content = "Gleam packages that spark joy" },
+  { property = "og:description", content = "Filtered list of Gleam packages. Search by name, code, type, or function" },
+  { property = "og:image", content = "https://correctarity.com/static/jooc/sparkjoy.jpg" },
+  { property = "og:image:type", content = "image/jpg" },
+]
+links = [
+  { rel = "icon", href = "/static/lucy_square.svg", type = "image/svg+xml" },
+]

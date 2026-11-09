@@ -660,14 +660,14 @@ fn view_star(
         [
           {
             let svg = case model.lucy {
-              Searching -> "https://gleam.run/images/lucy/lucyhappy.svg"
+              Searching -> "/static/jooc/lucyhappy.svg"
               NotSearching ->
                 // this is a mess because the css to control during spin animation is class slop
                 // and we know havent loaded yet because all_pkg_names is empty
                 case model.search_result, model.all_pkg_names {
-                  _, [] -> "https://gleam.run/images/lucy/lucy.svg"
-                  [], _ -> "https://gleam.run/images/lucy/lucydebugfail.svg"
-                  _, _ -> "https://gleam.run/images/lucy/lucy.svg"
+                  _, [] -> "/static/jooc/lucy.svg"
+                  [], _ -> "/static/jooc/lucydebugfail.svg"
+                  _, _ -> "/static/jooc/lucy.svg"
                 }
             }
             star_image(
@@ -679,8 +679,7 @@ fn view_star(
             )
           },
           case animated {
-            True ->
-              star_image("happy", "https://gleam.run/images/lucy/lucyhappy.svg")
+            True -> star_image("happy", "/static/jooc/lucyhappy.svg")
             False -> element.none()
           },
         ],
