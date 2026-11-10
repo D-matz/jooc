@@ -23,6 +23,22 @@ pub const info_only = all <> " WHERE instr(lower(p.name), lower(?)) > 0
    OR instr(lower(p.owners), lower(?)) > 0
 ORDER BY p.recent_downloads DESC, p.id"
 
+pub const canonical =
+  "SELECT
+  p.name, p.description, p.repository, p.updated_at, p.owners,
+  p.total_downloads, p.recent_downloads, p.latest_version,
+  m.name AS module,
+  char(2) || CAST(
+    substr(CAST(m.source AS BLOB), d.start_pos + 1, d.end_pos - d.start_pos)
+    AS TEXT
+  ) || char(3) AS snippet
+FROM canonical_forms c
+JOIN definitions d ON d.canonical_id = c.id
+JOIN modules m ON m.id = d.module_id
+JOIN packages p ON p.id = m.package_id
+WHERE c.canonical = ?1
+ORDER BY p.recent_downloads DESC, p.id, m.name, d.start_pos"
+
 // params: ?1 text, ?2 trigrams, ?3 similar package names, ?4 bm25 threshold
 pub const code_and_package =
   "WITH pkg AS (
@@ -59,13 +75,20 @@ SELECT name, description, repository, updated_at, owners,
 
   SELECT p.name, p.description, p.repository, p.updated_at, p.owners,
     p.total_downloads, p.recent_downloads, p.latest_version,
-    m.name,
-    snippet(modules_fts, 1, char(2), char(3), '', 64),
-    1, f.rank, 999999
-  FROM modules_fts f
-  JOIN modules m ON m.id = f.rowid
-  JOIN packages p ON p.id = m.package_id
-  WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
+    e.name,
+    substr(e.source, max(e.i - 40, 1), min(e.i - 1, 40))
+      || char(2) || substr(e.source, e.i, length(?1)) || char(3)
+      || substr(e.source, e.i + length(?1), 40),
+    1, e.score, 999999
+  FROM (
+    SELECT m.package_id, m.name, m.source, f.rank AS score,
+      instr(lower(m.source), lower(?1)) AS i
+    FROM modules_fts f
+    JOIN modules m ON m.id = f.rowid
+    WHERE modules_fts MATCH ('\"' || replace(?1, '\"', '\"\"') || '\"')
+  ) e
+  JOIN packages p ON p.id = e.package_id
+  WHERE e.i > 0
     AND p.id NOT IN (SELECT id FROM pkg)
 
   UNION ALL
@@ -82,19 +105,3 @@ SELECT name, description, repository, updated_at, owners,
     AND p.id NOT IN (SELECT id FROM pkg)
 )
 ORDER BY pos, kind, score"
-
-pub const canonical =
-  "SELECT
-  p.name, p.description, p.repository, p.updated_at, p.owners,
-  p.total_downloads, p.recent_downloads, p.latest_version,
-  m.name AS module,
-  char(2) || CAST(
-    substr(CAST(m.source AS BLOB), d.start_pos + 1, d.end_pos - d.start_pos)
-    AS TEXT
-  ) || char(3) AS snippet
-FROM canonical_forms c
-JOIN definitions d ON d.canonical_id = c.id
-JOIN modules m ON m.id = d.module_id
-JOIN packages p ON p.id = m.package_id
-WHERE c.canonical = ?1
-ORDER BY p.recent_downloads DESC, p.id, m.name, d.start_pos"
