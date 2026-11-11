@@ -25,6 +25,26 @@ pre {
   font-family: ui-monospace, monospace;
 }
 
+@media (max-width: 600px) {
+  .desktop-only {
+    display: none;
+  }
+}
+
+.mobile-only {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .desktop-only {
+    display: none;
+  }
+
+  .mobile-only {
+    display: block;
+  }
+}
+
 /* Animation */
 .spin {
   animation: spin 2s infinite;

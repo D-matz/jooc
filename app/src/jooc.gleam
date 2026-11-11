@@ -171,11 +171,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           let #(model, open) = open_db(model, resp.body)
           #(model, effect.batch([save, open]))
         }
-        Error(_) -> {
+        Error(err) -> {
+          echo err
           let model =
             Model(
               ..model,
-              database: DbError("could not load data from " <> data_src),
+              database: DbError(
+                "Failed to load package database from "
+                <> data_src
+                <> ". Maybe the database is no longer available. You could try checking connection and reloading.",
+              ),
             )
           #(model, effect.none())
         }
@@ -623,7 +628,7 @@ fn main_view(model: Model) -> Element(Msg) {
         // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
         a.value(model.search_text),
         a.type_("search"),
-        a.placeholder("search package by name, code, type, fn"),
+        a.placeholder("name, code, type, or fn"),
         a.disabled(!done),
         event.on_input(UserTypedQuery) |> event.debounce(200),
         a.styles([
@@ -632,7 +637,7 @@ fn main_view(model: Model) -> Element(Msg) {
           #("height", "3.5rem"),
           #("margin", "0 0 1rem"),
           #("padding", "0 1rem 0 3rem"),
-          #("font-size", "1rem"),
+          #("font-size", "1.1rem"),
           #("border", "1px solid #3a3a3a"),
           #("border-radius", "1.75rem"),
           #("background", "var(--bg)"),
@@ -761,7 +766,7 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
               ),
               link(
                 "https://packages.gleam.run?search=" <> model.search_text,
-                "https://packages.gleam.run?search=" <> model.search_text,
+                "packages.gleam.run",
               ),
             ])
           search_results ->
@@ -769,25 +774,25 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
               [
                 a.styles([
                   #("width", "100%"),
-                  #("table-layout", "fixed"),
+                  //#("table-layout", "fixed"),
                   #("border-collapse", "collapse"),
                 ]),
               ],
               [
-                h.colgroup([], [
-                  h.col([a.style("width", "30%")]),
-                  h.col([a.style("width", "20%")]),
-                  h.col([a.style("width", "20%")]),
-                  h.col([a.style("width", "17%")]),
-                  h.col([a.style("width", "13%")]),
-                ]),
+                // h.colgroup([], [
+                //   h.col([a.style("width", "30%")]),
+                //   h.col([a.style("width", "20%")]),
+                //   h.col([a.style("width", "20%")]),
+                //   h.col([a.style("width", "17%")]),
+                //   h.col([a.style("width", "13%")]),
+                // ]),
                 h.thead([], [
                   h.tr([], [
-                    th("package"),
-                    th("author"),
-                    th("links"),
-                    th("updated"),
-                    th("downloads"),
+                    th("package", False),
+                    th("author", True),
+                    th("links", False),
+                    th("updated", True),
+                    th("downloads", True),
                   ]),
                 ]),
                 ..list.map(search_results, fn(search_result) {
@@ -834,42 +839,54 @@ fn view_result(
   time_ago: timeago.TimeAgo,
 ) -> Element(msg) {
   let package = result.package
+  // these go twice so they can show up different place for mobile vs desktop
+  let updated = h.text(timeago.format(time_ago, package.updated_at))
+  let author = h.text(string.join(package.owners, ", "))
+  let downloads = h.text(int.to_string(package.total_downloads))
+
   h.tbody([], [
     h.tr([], [
-      td([
-        h.span([a.style("font-size", "1.25rem")], [
-          h.text(package.name),
-          h.wbr([]),
-          h.text("@" <> package.latest_version),
-        ]),
-      ]),
-      td([h.text(string.join(package.owners, ", "))]),
-      td([
-        h.div(
-          [
-            a.styles([
-              #("display", "flex"),
-              #("flex-wrap", "wrap"),
-              #("gap", "0.25rem 0.75rem"),
-            ]),
-          ],
-          [
-            link(
-              "https://"
-                <> string.replace(package.name, "_", "-")
-                <> ".hexdocs.pm",
-              "docs",
-            ),
-            case package.repository {
-              Some(url) -> link(url, "repo")
-              None -> element.none()
-            },
-            link("https://hex.pm/packages/" <> package.name, "hex"),
-          ],
-        ),
-      ]),
-      td([h.text(timeago.format(time_ago, package.updated_at))]),
-      td([h.text(int.to_string(package.total_downloads))]),
+      td(
+        [
+          h.div([a.style("font-size", "1.25rem")], [
+            h.text(package.name),
+            h.wbr([]),
+            h.text("@" <> package.latest_version),
+          ]),
+          h.span([a.class("mobile-only")], [author]),
+        ],
+        False,
+      ),
+      td([author], True),
+      td(
+        [
+          h.div(
+            [
+              a.styles([
+                #("display", "flex"),
+                #("flex-wrap", "wrap"),
+                #("gap", "0.25rem 0.75rem"),
+              ]),
+            ],
+            [
+              link(
+                "https://"
+                  <> string.replace(package.name, "_", "-")
+                  <> ".hexdocs.pm",
+                "docs",
+              ),
+              case package.repository {
+                Some(url) -> link(url, "repo")
+                None -> element.none()
+              },
+              link("https://hex.pm/packages/" <> package.name, "hex"),
+            ],
+          ),
+        ],
+        False,
+      ),
+      td([updated], True),
+      td([downloads], True),
     ]),
     h.tr([], [
       h.td(
@@ -878,10 +895,25 @@ fn view_result(
           a.styles([
             #("padding", "0.25rem 0 0.75rem"),
             #("border-bottom", "1px solid #3a3a3a"),
+            #("overflow-wrap", "anywhere"),
           ]),
         ],
         [
-          h.p([a.style("margin", "0")], [h.text(package.description)]),
+          h.p([a.style("margin", "0")], [
+            h.text(package.description),
+            h.span([a.class("mobile-only")], [
+              h.span([a.style("white-space", "nowrap")], [
+                h.text("updated "),
+                updated,
+                h.text(", "),
+              ]),
+              h.wbr([]),
+              h.span([a.style("white-space", "nowrap")], [
+                downloads,
+                h.text(" downloads"),
+              ]),
+            ]),
+          ]),
           ..list.map(result.snippet, code_snippet)
         ],
       ),
@@ -890,22 +922,32 @@ fn view_result(
 }
 
 fn code_snippet(snippet: ModuleSnippet) -> Element(msg) {
-  h.div([a.styles([#("margin", "0.75rem 0 0.75rem 1rem")])], [
-    h.p([a.styles([#("margin", "0 0 0.25rem"), #("font-weight", "600")])], [
-      h.text(snippet.module_name),
-    ]),
-    ..case snippet.snippet {
-      FuzzyMatch(before:, match:, after:) -> [
-        code_block([
-          h.text(before),
-          h.mark([a.style("background-color", "#ffaff3")], [h.text(match)]),
-          h.text(after),
-        ]),
-      ]
-      Canonical(definitions:) ->
-        list.map(definitions, fn(source) { code_block([h.text(source)]) })
-    }
-  ])
+  h.div(
+    [
+      a.styles([
+        #("margin", "0.75rem 0 0.75rem 1rem"),
+        // mysterious ai css to not make page zoom on mobile from snippet idk is it needed?
+        #("width", "0"),
+        #("min-width", "calc(100% - 1rem)"),
+      ]),
+    ],
+    [
+      h.p([a.styles([#("margin", "0 0 0.25rem"), #("font-weight", "600")])], [
+        h.text(snippet.module_name),
+      ]),
+      ..case snippet.snippet {
+        FuzzyMatch(before:, match:, after:) -> [
+          code_block([
+            h.text(before),
+            h.mark([a.style("background-color", "#ffaff3")], [h.text(match)]),
+            h.text(after),
+          ]),
+        ]
+        Canonical(definitions:) ->
+          list.map(definitions, fn(source) { code_block([h.text(source)]) })
+      }
+    ],
+  )
 }
 
 fn code_block(elts) {
@@ -917,7 +959,7 @@ fn code_block(elts) {
         #("padding", "0.5rem 0.75rem"),
         #("background", "rgba(128, 128, 128, 0.15)"),
         #("border-radius", "0.3rem"),
-        #("white-space", "pre-wrap"),
+        #("white-space", "pre"),
         #("overflow-x", "auto"),
       ]),
     ],
@@ -925,7 +967,7 @@ fn code_block(elts) {
   )
 }
 
-fn th(label: String) -> Element(msg) {
+fn th(label: String, desktop_only: Bool) -> Element(msg) {
   h.th(
     [
       a.styles([
@@ -933,14 +975,16 @@ fn th(label: String) -> Element(msg) {
         #("padding", "0.5rem 1rem 0.5rem 0"),
         #("border-bottom", "1px solid #3a3a3a"),
       ]),
+      a.classes([#("desktop-only", desktop_only)]),
     ],
     [h.text(label)],
   )
 }
 
-fn td(children: List(Element(msg))) -> Element(msg) {
+fn td(children: List(Element(msg)), desktop_only: Bool) -> Element(msg) {
   h.td(
     [
+      a.classes([#("desktop-only", desktop_only)]),
       a.styles([
         #("padding", "0.75rem 1rem 0 0"),
         #("vertical-align", "top"),
