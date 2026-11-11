@@ -6,6 +6,9 @@
 ////               gleam_package_interface, gleam_http, gleam_httpc, gleam_time,
 ////               star, sqlight
 
+import argv
+import bucket
+import bucket/put_object
 import canonical
 import glance
 import gleam/bit_array
@@ -23,6 +26,7 @@ import gleam/package_interface
 import gleam/result
 import gleam/string
 import gleam/time/timestamp.{type Timestamp}
+import simplifile
 import sqlight
 import star
 
@@ -101,10 +105,42 @@ fn unix_seconds(time: Timestamp) -> Int {
 // ---------------------------------------------------------------------------
 
 pub fn main() -> Nil {
-  case all_packages() {
-    Ok(packages) -> list.each(packages, process)
-    Error(message) -> io.println("Error: " <> message)
+  case argv.load().arguments {
+    [credentials] -> {
+      case all_packages() {
+        Ok(packages) -> list.each(packages, process)
+        Error(message) -> io.println("Error: " <> message)
+      }
+      upload(credentials)
+      io.println("Uploaded " <> db_path)
+    }
+    _ -> io.println("Usage: gleam run ACCESS_KEY_ID,SECRET_ACCESS_KEY")
   }
+}
+
+fn upload(credentials: String) -> Nil {
+  let assert Ok(#(access_key_id, secret_access_key)) =
+    string.split_once(credentials, ",")
+    as "Use the format ACCESS_KEY_ID,SECRET_ACCESS_KEY"
+
+  let creds =
+    bucket.credentials(
+      "21d22098b8563166bdc93387685252e4.r2.cloudflarestorage.com",
+      access_key_id,
+      secret_access_key,
+    )
+    |> bucket.with_region("auto")
+
+  let assert Ok(data) = simplifile.read_bits(db_path) as "Cannot read the db"
+
+  let request =
+    put_object.request(bucket: "pkglist", key: db_path, body: data)
+    |> put_object.build(creds)
+
+  let assert Ok(response) = httpc.send_bits(request)
+    as "Cannot send the request"
+  let assert Ok(_) = put_object.response(response) as "The upload failed"
+  Nil
 }
 
 // An error in one package does not stop the others.
