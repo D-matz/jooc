@@ -6,6 +6,7 @@
 ////               gleam_package_interface, gleam_http, gleam_httpc, gleam_time,
 ////               star, sqlight
 
+import storage
 import argv
 import bucket
 import bucket/put_object
@@ -21,7 +22,7 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/package_interface
 import gleam/result
 import gleam/string
@@ -58,43 +59,6 @@ const insert_module =
 const insert_definition =
   "INSERT INTO definitions_in (module_id, kind, canonical, start_pos, end_pos) VALUES (?, ?, ?, ?, ?)"
 
-/// A Hex package, as listed in already_read.json.
-pub type Package {
-  Package(
-    name: String,
-    description: String,
-    repository: Option(String),
-    updated_at: Timestamp,
-    owners: List(String),
-    total_downloads: Int,
-    recent_downloads: Int,
-    latest_version: String,
-  )
-}
-
-pub fn package_decoder() -> decode.Decoder(Package) {
-  use name <- decode.field("name", decode.string)
-  use description <- decode.field("description", decode.string)
-  use repository <- decode.field("repository", decode.optional(decode.string))
-  use updated_at <- decode.field(
-    "updated-at",
-    decode.int |> decode.map(timestamp.from_unix_seconds),
-  )
-  use owners <- decode.field("owners", decode.list(decode.string))
-  use total_downloads <- decode.field("total-downloads", decode.int)
-  use recent_downloads <- decode.field("recent-downloads", decode.int)
-  use latest_version <- decode.field("latest-version", decode.string)
-  decode.success(Package(
-    name:,
-    description:,
-    repository:,
-    updated_at:,
-    owners:,
-    total_downloads:,
-    recent_downloads:,
-    latest_version:,
-  ))
-}
 
 fn unix_seconds(time: Timestamp) -> Int {
   time |> timestamp.to_unix_seconds |> float.round
@@ -108,17 +72,27 @@ pub fn main() -> Nil {
   case argv.load().arguments {
     [credentials] -> {
       case all_packages() {
-        Ok(packages) -> list.each(packages, process)
+        Ok(packages) -> {
+          let good_json =
+            json.array(packages, storage.package_to_json)
+            |> json.to_string
+            |> bit_array.from_string
+
+          upload(credentials, "good.json", good_json)
+          list.each(packages, process)
+        }
         Error(message) -> io.println("Error: " <> message)
       }
-      upload(credentials)
+      let assert Ok(data) = simplifile.read_bits(db_path)
+        as "Cannot read the db"
+      upload(credentials, "packages.sqlite", data)
       io.println("Uploaded " <> db_path)
     }
     _ -> io.println("Usage: gleam run ACCESS_KEY_ID,SECRET_ACCESS_KEY")
   }
 }
 
-fn upload(credentials: String) -> Nil {
+fn upload(credentials: String, key: String, data: BitArray) -> Nil {
   let assert Ok(#(access_key_id, secret_access_key)) =
     string.split_once(credentials, ",")
     as "Use the format ACCESS_KEY_ID,SECRET_ACCESS_KEY"
@@ -131,10 +105,8 @@ fn upload(credentials: String) -> Nil {
     )
     |> bucket.with_region("auto")
 
-  let assert Ok(data) = simplifile.read_bits(db_path) as "Cannot read the db"
-
   let request =
-    put_object.request(bucket: "pkglist", key: db_path, body: data)
+    put_object.request(bucket: "pkglist", key: key, body: data)
     |> put_object.build(creds)
 
   let assert Ok(response) = httpc.send_bits(request)
@@ -144,14 +116,14 @@ fn upload(credentials: String) -> Nil {
 }
 
 // An error in one package does not stop the others.
-fn process(package: Package) -> Nil {
+fn process(package: storage.Package) -> Nil {
   case update(package) {
     Ok(message) -> io.println(message)
     Error(message) -> io.println("Error: " <> package.name <> ": " <> message)
   }
 }
 
-fn update(package: Package) -> Result(String, String) {
+fn update(package: storage.Package) -> Result(String, String) {
   let label = package.name <> " " <> package.latest_version
   use current <- result.try(
     is_current(package) |> result.map_error(string.inspect),
@@ -166,20 +138,20 @@ fn update(package: Package) -> Result(String, String) {
 }
 
 // All packages in the "good" list of already_read.json.
-fn all_packages() -> Result(List(Package), String) {
+fn all_packages() -> Result(List(storage.Package), String) {
   use bits <- result.try(fetch(already_read_url))
   use text <- result.try(
     bit_array.to_string(bits)
     |> result.replace_error("already_read.json is not text"),
   )
   json.parse(text, using: {
-    use good <- decode.field("good", decode.list(package_decoder()))
+    use good <- decode.field("good", decode.list(storage.package_decoder()))
     decode.success(good)
   })
   |> result.map_error(string.inspect)
 }
 
-fn add_package(package: Package) -> Result(Int, String) {
+fn add_package(package: storage.Package) -> Result(Int, String) {
   let interface_url =
     "https://"
     <> string.replace(package.name, "_", "-")
@@ -285,7 +257,7 @@ fn source_files(tarball: BitArray) -> Result(List(#(String, String)), String) {
 // ---------------------------------------------------------------------------
 
 // True when the db has this package with the same updated_at.
-fn is_current(package: Package) -> Result(Bool, sqlight.Error) {
+fn is_current(package: storage.Package) -> Result(Bool, sqlight.Error) {
   sqlight.with_connection(db_path, fn(conn) {
     use found <- result.try(sqlight.query(
       select_updated_at,
@@ -299,7 +271,7 @@ fn is_current(package: Package) -> Result(Bool, sqlight.Error) {
 
 fn store_package(
   conn: sqlight.Connection,
-  package: Package,
+  package: storage.Package,
   modules: List(#(String, String, List(canonical.Entry))),
 ) -> Result(Int, sqlight.Error) {
   // Foreign keys must be on, so that deletes cascade.
@@ -316,7 +288,7 @@ fn store_package(
 
 fn store_all(
   conn: sqlight.Connection,
-  package: Package,
+  package: storage.Package,
   modules: List(#(String, String, List(canonical.Entry))),
 ) -> Result(Int, sqlight.Error) {
   // A new updated_at makes a trigger delete the old modules.
@@ -332,7 +304,7 @@ fn store_all(
 
 fn upsert_package(
   conn: sqlight.Connection,
-  package: Package,
+  package: storage.Package,
 ) -> Result(Int, sqlight.Error) {
   use ids <- result.try(sqlight.query(
     upsert_package_sql,
