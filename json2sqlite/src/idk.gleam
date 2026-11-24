@@ -6,7 +6,6 @@
 ////               gleam_package_interface, gleam_http, gleam_httpc, gleam_time,
 ////               star, sqlight
 
-import storage
 import argv
 import bucket
 import bucket/put_object
@@ -30,6 +29,7 @@ import gleam/time/timestamp.{type Timestamp}
 import simplifile
 import sqlight
 import star
+import storage
 
 const db_path = "packages.sqlite"
 
@@ -58,7 +58,6 @@ const insert_module =
 // The definitions_in view makes the canonical form when it does not exist.
 const insert_definition =
   "INSERT INTO definitions_in (module_id, kind, canonical, start_pos, end_pos) VALUES (?, ?, ?, ?, ?)"
-
 
 fn unix_seconds(time: Timestamp) -> Int {
   time |> timestamp.to_unix_seconds |> float.round
@@ -92,7 +91,12 @@ pub fn main() -> Nil {
   }
 }
 
-fn upload(credentials: String, key: String, data: BitArray, content_type: String) -> Nil {
+fn upload(
+  credentials: String,
+  key: String,
+  data: BitArray,
+  content_type: String,
+) -> Nil {
   let assert Ok(#(access_key_id, secret_access_key)) =
     string.split_once(credentials, ",")
     as "Use the format ACCESS_KEY_ID,SECRET_ACCESS_KEY"
@@ -109,7 +113,6 @@ fn upload(credentials: String, key: String, data: BitArray, content_type: String
     put_object.request(bucket: "pkglist", key: key, body: data)
     |> put_object.build(creds)
     |> request.set_header("content-type", content_type)
-
 
   let assert Ok(response) = httpc.send_bits(request)
     as "Cannot send the request"
