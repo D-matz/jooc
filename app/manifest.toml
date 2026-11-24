@@ -61,6 +61,7 @@ packages = [
 
 [requirements]
 edit_distance = { version = ">= 3.0.1 and < 4.0.0" }
+gleam_fetch = { version = ">= 1.4.1 and < 2.0.0" }
 gleam_hexpm = { version = ">= 3.0.1 and < 4.0.0" }
 gleam_http = { version = ">= 4.5.0 and < 5.0.0" }
 gleam_javascript = { version = ">= 1.0.1 and < 2.0.0" }

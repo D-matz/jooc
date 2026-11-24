@@ -11,6 +11,7 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/result
 import gleam/string
 import gleam/time/timestamp
@@ -22,10 +23,12 @@ import lustre/element.{type Element}
 import lustre/element/html as h
 import lustre/event
 import modem
+import range_map
 import rsvp
 import sql
 import sqlite
 import storage
+import streamer
 import timeago
 
 pub fn main() {
@@ -59,21 +62,31 @@ type Snippet {
 }
 
 type Db {
-  DbLoadingFromCache
-  DbLoadingFromServer
-  DbLoaded(db: sqlite.Database, animation: Option(Animation))
+  DbLoading
+  DbLoaded(PkgDb)
   DbError(String)
 }
 
-type Animation {
-  Finishing
-  Done
+type PkgDb {
+  Metadata(db: List(PackageLowercase), loading_percent: Option(Float))
+  Code(db: sqlite.Database)
+}
+
+type PackageLowercase {
+  PackageLowercase(
+    package: storage.Package,
+    name: String,
+    description: String,
+    owners: List(String),
+  )
 }
 
 type Search {
   Searching
   NotSearching
 }
+
+const metadata_src_json = "https://bucket.correctarity.com/good.json"
 
 const data_src = "https://bucket.correctarity.com/packages.sqlite"
 
@@ -92,7 +105,7 @@ fn init(_) -> #(Model, Effect(Msg)) {
   }
   #(
     Model(
-      DbLoadingFromCache,
+      DbLoading,
       [],
       NotSearching,
       [],
@@ -110,9 +123,11 @@ type Msg {
     result: Result(response.Response(String), rsvp.Error(String)),
   )
   CacheLoaded(Result(BitArray, Nil))
-  ServerReturnedData(Result(Response(BitArray), rsvp.Error(BitArray)))
+  ServerReturnedMetadata(Result(List(storage.Package), rsvp.Error(String)))
+  UserClickedDownloadCode
+  ServerReturnedCode(Result(Response(BitArray), rsvp.Error(BitArray)))
+  ServerReturnedLoadProgress(Float)
   SqliteReturnedOpen(Result(sqlite.Database, String))
-  SpinFinished
   SqliteReturnedQuery(
     query_was: Query,
     search_text_was: String,
@@ -143,24 +158,25 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
           #(model, get_server_etag)
         }
-        Error(_) -> download_server_db(model)
+        Error(_) -> download_server_json(model)
       }
     ServerReturnedEtag(cached_etag, server_response) ->
       case server_response {
-        Error(_) -> download_server_db(model)
+        Error(_) -> download_server_json(model)
         Ok(server_response) ->
           case server_response |> response.get_header("etag") {
             Ok(server_etag) ->
               case server_etag == cached_etag {
                 True -> #(model, sqlite.load_cached(CacheLoaded))
-                False -> download_server_db(model)
+                False -> download_server_json(model)
               }
-            Error(_) -> download_server_db(model)
+            Error(_) -> download_server_json(model)
           }
       }
     CacheLoaded(Ok(cache_data)) -> open_db(model, cache_data)
-    CacheLoaded(Error(_)) -> download_server_db(model)
-    ServerReturnedData(load_result) ->
+    CacheLoaded(Error(_)) -> download_server_json(model)
+    UserClickedDownloadCode -> download_server_db(model)
+    ServerReturnedCode(load_result) ->
       case load_result {
         Ok(resp) -> {
           // we rely on having etag to save db so we will know if there is newer version
@@ -185,33 +201,63 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           #(model, effect.none())
         }
       }
-    SqliteReturnedOpen(load_result) -> {
-      let #(database, exec) = case load_result {
-        Ok(db) -> #(
-          case model.database {
-            DbLoadingFromCache -> DbLoaded(db, None)
-            DbLoadingFromServer -> DbLoaded(db, Some(Finishing))
-            DbLoaded(_, _) -> panic as "xd"
-            DbError(_) -> panic as "xdd"
-          },
-          sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
-            QueryCanonical,
-            model.search_text,
-            _,
-          )),
-        )
-        Error(err) -> #(DbError(err), effect.none())
+    ServerReturnedMetadata(load_result) ->
+      case load_result {
+        Ok(resp) -> {
+          let resp =
+            list.sort(resp, fn(a, b) {
+              timestamp.compare(a.updated_at, b.updated_at) |> order.negate
+            })
+            |> list.map(fn(pkg) {
+              PackageLowercase(
+                pkg,
+                name: string.lowercase(pkg.name),
+                description: string.lowercase(pkg.description),
+                owners: list.map(pkg.owners, string.lowercase),
+              )
+            })
+          let all_pkg_names = list.map(resp, fn(pkg) { pkg.name })
+          let model =
+            Model(
+              ..model,
+              database: DbLoaded(Metadata(db: resp, loading_percent: None)),
+              all_pkg_names:,
+            )
+          let search_result = case model.query_from_initial_uri {
+            Some(text) -> search_metadata(resp, text)
+            None -> search_metadata(resp, "")
+          }
+          // if we initially load json metadata, just do initial uri query in that
+          // and dont run uri query again after user clicks to load sqlite db
+          let model =
+            Model(..model, search_result:, query_from_initial_uri: None)
+
+          #(model, effect.none())
+        }
+        Error(err) -> {
+          echo err
+          let model =
+            Model(
+              ..model,
+              database: DbError(
+                "Failed to load metadata json from "
+                <> metadata_src_json
+                <> ". Maybe good.json is no longer available. You could try checking connection and reloading.",
+              ),
+            )
+          #(model, effect.none())
+        }
       }
-      let model = Model(..model, database:, lucy: Searching)
-      #(model, exec)
-    }
-    SpinFinished -> {
-      let model = case model.database {
-        DbLoaded(database, _) ->
-          Model(..model, database: DbLoaded(database, Some(Done)))
-        _ -> model
-      }
-      #(model, effect.none())
+    SqliteReturnedOpen(Error(_)) -> panic as "db open failed xdd"
+    SqliteReturnedOpen(Ok(db)) -> {
+      let get_all_pkg_names =
+        sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
+          QueryCanonical,
+          model.search_text,
+          _,
+        ))
+      let model = Model(..model, database: DbLoaded(Code(db)))
+      #(model, get_all_pkg_names)
     }
     SqliteReturnedQuery(query_was, search_text_was, got) -> {
       case search_text_was == model.search_text {
@@ -228,7 +274,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     UserTypedQuery(text) -> text_to_query(text, model)
     UserClickedButton(premade_query) -> {
       let exec = case model.database {
-        DbLoaded(db, _) -> {
+        DbLoaded(Code(db)) -> {
           sqlite.query(db, premade_query, [], SqliteReturnedQuery(
             QueryFuzzy,
             "",
@@ -240,6 +286,16 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       let model = Model(..model, lucy: Searching, search_text: "")
       #(model, exec)
     }
+    ServerReturnedLoadProgress(progress) ->
+      case model.database {
+        DbLoaded(Metadata(_old_load_percent, db:)) -> {
+          let database =
+            DbLoaded(Metadata(db:, loading_percent: Some(progress)))
+          let model = Model(..model, database:)
+          #(model, effect.none())
+        }
+        _ -> #(model, effect.none())
+      }
   }
 }
 
@@ -270,7 +326,11 @@ fn handle_query_result(
   // as fts5 trigrams doesnt seem great for eg luster -> lustre
   // also first time we get response, run user's initial query from url...
   // can't just run it immediately because we need to load package names first here
-  // the pkg name list kind of doing double duty to indicate we ready for user url query, kind of confusing
+
+  // if you immediately load sqlite, do need to get all pkgs
+  // if you go from json loaded -> sqlite, dont need to do this
+  // the pkg name list kind of doing double duty
+  // to indicate if we have done an initial query from uri yet, confusing
 
   case model.all_pkg_names {
     [] -> {
@@ -296,13 +356,37 @@ fn open_db(model: Model, sqlite_db: BitArray) -> #(Model, Effect(Msg)) {
   #(model, sqlite.open(sqlite_db, SqliteReturnedOpen))
 }
 
-fn download_server_db(model) {
-  let model = Model(..model, database: DbLoadingFromServer)
-  let assert Ok(req) = request.to(data_src)
+fn download_server_db(model: Model) {
+  case model.database {
+    DbLoaded(Metadata(_loading_percent, db:)) -> {
+      let loading_percent = Some(0.0)
+      // (0.0)
+      let model =
+        Model(..model, database: DbLoaded(Metadata(db:, loading_percent:)))
+      let assert Ok(req) = request.to(data_src)
+      let download_effect =
+        req
+        |> request.set_body(<<>>)
+        |> streamer.load_bits(ServerReturnedLoadProgress, ServerReturnedCode)
+      #(model, download_effect)
+    }
+    _ -> {
+      echo "should not be able to download server db from anything other than already have json"
+      #(model, effect.none())
+    }
+  }
+}
+
+fn download_server_json(model) {
+  let assert Ok(req) = request.to(metadata_src_json)
+  let handler =
+    rsvp.expect_json(
+      decode.list(storage.package_decoder()),
+      ServerReturnedMetadata,
+    )
   let download_effect =
     req
-    |> request.set_body(<<>>)
-    |> rsvp.send_bits(rsvp.expect_ok_response(ServerReturnedData))
+    |> rsvp.send(handler)
   #(model, download_effect)
 }
 
@@ -311,10 +395,10 @@ fn text_to_query(text, model) {
   let push_url = modem.push("", Some(uri.percent_encode(text)), None)
   let model = Model(..model, search_text: text)
   let text = string.trim(text)
-  let exec = case model.database {
-    DbLoaded(db, _) -> {
+  case model.database {
+    DbLoaded(Code(db)) -> {
       let chars = string.to_graphemes(text)
-      case chars {
+      let exec = case chars {
         [] ->
           sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
             QueryFuzzy,
@@ -358,12 +442,32 @@ fn text_to_query(text, model) {
           }
         }
       }
+      let effect = effect.batch([exec, push_url])
+      let model = Model(..model, lucy: Searching)
+      #(model, effect)
     }
-    _ -> effect.none()
+    DbLoaded(Metadata(_, db:)) -> {
+      let search_result = search_metadata(db, text)
+      let model = Model(..model, search_result:)
+      #(model, push_url)
+    }
+    _ -> #(model, effect.none())
   }
-  let effect = effect.batch([exec, push_url])
-  let model = Model(..model, lucy: Searching)
-  #(model, effect)
+}
+
+fn search_metadata(
+  db: List(PackageLowercase),
+  text: String,
+) -> List(SearchResult) {
+  let text = string.lowercase(text)
+  let contains_user_text = fn(check) { check |> string.contains(text) }
+  list.filter(db, fn(pkg) {
+    pkg.name |> contains_user_text
+    || pkg.description |> contains_user_text
+    || pkg.owners
+    |> list.any(contains_user_text)
+  })
+  |> list.map(fn(pkg) { SearchResult(pkg.package, []) })
 }
 
 // see if we can parse the user's query into a type or function
@@ -582,38 +686,17 @@ fn similar_pkg_names(query: String, pkgs: List(String)) {
   }
 }
 
-// -------------- view ---------------
-
 fn view(model: Model) -> Element(Msg) {
   case model.database {
-    DbLoadingFromCache -> element.none()
-    DbLoadingFromServer | DbLoaded(_, _) -> main_view(model)
+    DbLoading -> element.none()
+    DbLoaded(pkg_db) -> main_view(model, pkg_db)
     DbError(err) -> h.text(err)
   }
 }
 
-fn main_view(model: Model) -> Element(Msg) {
-  let #(done, animated) = case model.database {
-    DbLoaded(_, None) -> #(True, False)
-    DbLoaded(_, Some(Done)) -> #(True, True)
-    _ -> #(False, True)
-  }
-  let spin_events = case model.database {
-    DbLoaded(_, Some(Finishing)) -> [
-      event.on("animationiteration", {
-        use name <- decode.field("animationName", decode.string)
-        case name {
-          "spin" -> decode.success(SpinFinished)
-          _ -> decode.failure(SpinFinished, "spin")
-        }
-      }),
-    ]
-    _ -> []
-  }
-
+fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
   h.div(
     [
-      a.classes([#("done", done && animated)]),
       a.styles([
         #("--w", "770px"),
         #("box-sizing", "border-box"),
@@ -623,215 +706,164 @@ fn main_view(model: Model) -> Element(Msg) {
       ]),
     ],
     [
-      view_star(done, animated, spin_events, model),
-      h.input([
-        // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
-        a.value(model.search_text),
-        a.type_("search"),
-        a.placeholder("name, code, type, or fn"),
-        a.disabled(!done),
-        event.on_input(UserTypedQuery) |> event.debounce(200),
-        a.styles([
-          #("box-sizing", "border-box"),
-          #("width", "100%"),
-          #("height", "3.5rem"),
-          #("margin", "0 0 1rem"),
-          #("padding", "0 1rem 0 3rem"),
-          #("font-size", "1.1rem"),
-          #("border", "1px solid #3a3a3a"),
-          #("border-radius", "1.75rem"),
-          #("background", "var(--bg)"),
-          #("color", "var(--text)"),
-          #("transition", "opacity 1s"),
-          #("opacity", case done {
-            True -> "1"
-            False -> "0"
-          }),
-          #("pointer-events", case done {
-            True -> "auto"
-            False -> "none"
-          }),
-        ]),
-      ]),
+      h.p([a.style("height", "1.5rem")], case pkg_db {
+        Metadata(_, loading_percent:) ->
+          case loading_percent {
+            Some(percent) -> {
+              let percent = float.round(percent *. 20.0)
+              range_map.range(from: 0, to: 20, run: fn(num) {
+                let src = case num < percent {
+                  True -> "/static/jooc/lucy.svg"
+                  False -> "/static/jooc/lucy-empty-inside.svg"
+                }
+                h.img([a.src(src), a.style("width", "5%")])
+              })
+            }
+            None -> [
+              h.button(
+                [event.on_click(UserClickedDownloadCode), ..btn_styles()],
+                [
+                  h.text(
+                    "enable search by code text and type/fn (will download 150MB and search in browser)",
+                  ),
+                ],
+              ),
+            ]
+          }
+        Code(_) -> [h.text("code search enabled")]
+      }),
+      h.div(
+        [
+          a.styles([
+            #("position", "relative"),
+            #("margin-bottom", "1rem"),
+          ]),
+        ],
+        [
+          view_star(model),
+          h.input([
+            // doesn't really need to be controlled input except maybe nice to clear when user clicks button "popular" etc
+            a.value(model.search_text),
+            a.type_("search"),
+            a.placeholder(case pkg_db {
+              Metadata(_, _) -> "name"
+              Code(_) -> "name, code, type, or fn"
+            }),
+            event.on_input(UserTypedQuery) |> event.debounce(200),
+            a.styles([
+              #("box-sizing", "border-box"),
+              #("width", "100%"),
+              #("height", "3.5rem"),
+              #("display", "block"),
+              #("margin", "0"),
+              #("padding", "0 1rem 0 3rem"),
+              #("font-size", "1.1rem"),
+              #("border", "1px solid #3a3a3a"),
+              #("border-radius", "1.75rem"),
+              #("background", "var(--bg)"),
+              #("color", "var(--text)"),
+            ]),
+          ]),
+        ],
+      ),
       view_results(model, timeago.new()),
     ],
   )
 }
 
-fn view_star(
-  done: Bool,
-  animated: Bool,
-  spin_events: List(a.Attribute(Msg)),
-  model: Model,
-) -> Element(Msg) {
-  let position = case done {
-    False -> [
-      #("top", "50%"),
-      #("left", "50%"),
-      #("width", "min(400px, 70vmin)"),
-      #("height", "min(400px, 70vmin)"),
-    ]
-    True -> [
-      #("top", "3.75rem"),
-      #("left", "calc(max(0px, 50% - var(--w) / 2) + 1.2rem + 24px)"),
-      #("width", "32px"),
-      #("height", "32px"),
-    ]
+fn view_star(model: Model) -> Element(Msg) {
+  let src = case model.lucy {
+    Searching -> "/static/jooc/lucyhappy.svg"
+    NotSearching -> "/static/jooc/lucy.svg"
   }
 
-  h.div(
-    [
-      a.class("mover"),
-      a.styles([
-        #("position", "absolute"),
-        #("z-index", "1"),
-        #("transform", "translate(-50%, -50%)"),
-        #(
-          "transition",
-          "top var(--move) ease-in-out, width var(--move) ease-in-out, height var(--move) ease-in-out",
-        ),
-        ..position
-      ]),
-    ],
-    [
-      h.div(
-        [
-          a.classes([#("spin", animated)]),
-          a.styles([
-            #("position", "relative"),
-            #("width", "100%"),
-            #("height", "100%"),
-          ]),
-          ..spin_events
-        ],
-        [
-          {
-            let svg = case model.lucy {
-              Searching -> "/static/jooc/lucyhappy.svg"
-              NotSearching ->
-                // this is a mess because the css to control during spin animation is class slop
-                // and we know havent loaded yet because all_pkg_names is empty
-                case model.search_result, model.all_pkg_names {
-                  _, [] -> "/static/jooc/lucy.svg"
-                  [], _ -> "/static/jooc/lucydebugfail.svg"
-                  _, _ -> "/static/jooc/lucy.svg"
-                }
-            }
-            star_image(
-              case animated {
-                True -> "normal"
-                False -> ""
-              },
-              svg,
-            )
-          },
-          case animated {
-            True -> star_image("happy", "/static/jooc/lucyhappy.svg")
-            False -> element.none()
-          },
-        ],
-      ),
-    ],
-  )
-}
-
-fn star_image(name: String, src: String) -> Element(Msg) {
   h.img([
-    a.class(name),
     a.src(src),
     a.styles([
       #("position", "absolute"),
-      #("width", "100%"),
-      #("height", "100%"),
+      #("left", "8px"),
+      #("top", "50%"),
+      #("transform", "translateY(-50%)"),
+      #("width", "32px"),
+      #("height", "32px"),
+      #("pointer-events", "none"),
     ]),
   ])
 }
 
 fn view_results(model: Model, time_ago) -> Element(Msg) {
-  case model.database {
-    // never actually get here we just echo err
-    // should probably take it out
-    DbError(message) -> h.p([a.style("margin", "0")], [h.text(message)])
-    DbLoaded(_, None) | DbLoaded(_, Some(Done)) ->
-      // case model.lucy {
-      //   Searching -> element.none()
-      //   NotSearching ->
-      // could make it show nothing as soon as you search, but kind of jarring
-      h.div([], [
-        case model.search_result {
-          [] ->
-            h.p([a.style("margin", "0")], [
-              h.text(
-                "No matching packages found here, but this is not a complete index of all gleam packages. Maybe try ",
-              ),
-              link(
-                "https://packages.gleam.run?search=" <> model.search_text,
-                "packages.gleam.run",
-              ),
-            ])
-          search_results ->
-            h.table(
-              [
-                a.styles([
-                  #("width", "100%"),
-                  //#("table-layout", "fixed"),
-                  #("border-collapse", "collapse"),
-                ]),
-              ],
-              [
-                // h.colgroup([], [
-                //   h.col([a.style("width", "30%")]),
-                //   h.col([a.style("width", "20%")]),
-                //   h.col([a.style("width", "20%")]),
-                //   h.col([a.style("width", "17%")]),
-                //   h.col([a.style("width", "13%")]),
-                // ]),
-                h.thead([], [
-                  h.tr([], [
-                    th("package", False),
-                    th("author", True),
-                    th("links", False),
-                    th("updated", True),
-                    th("downloads", True),
-                  ]),
-                ]),
-                ..list.map(search_results, fn(search_result) {
-                  view_result(search_result, time_ago)
-                })
-              ],
-            )
-        },
-        h.footer(
+  h.div([], [
+    case model.search_result {
+      [] ->
+        h.p([a.style("margin", "0")], [
+          h.text(
+            "No matching packages found here, but this is not a complete index of all gleam packages. Maybe try ",
+          ),
+          link(
+            "https://packages.gleam.run?search=" <> model.search_text,
+            "packages.gleam.run",
+          ),
+        ])
+      search_results ->
+        h.table(
           [
-            a.style("padding-top", "10px"),
-            a.style("padding-bottom", "10px"),
+            a.styles([
+              #("width", "100%"),
+              //#("table-layout", "fixed"),
+              #("border-collapse", "collapse"),
+            ]),
           ],
           [
-            h.text(
-              "This includes only Gleam packages that spark joy for me, i.e. not all packages are included. This package list is ",
-            ),
-            h.strong([], [h.text("not maintained by the Gleam team")]),
-            h.text(", it is not official or objective or anything. "),
-            link("https://packages.gleam.run", "packages.gleam.run"),
-            h.text(
-              " Is Gleam's official site for seeing all packages. Thanks also to ",
-            ),
-            link("https://hex.pm/", "hex.pm"),
-            h.text(" and "),
-            link("https://gloogle.run", "gloogle.run"),
-            h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
-            h.br([]),
-            h.text("See all packages ordered by: "),
-            btn("new", sql.all_pkgs_by_recent),
-            btn("popular", sql.all_pkgs_by_downloaded),
-            btn("big", sql.all_pkgs_by_big),
-            btn("small", sql.all_pkgs_by_small),
+            // h.colgroup([], [
+            //   h.col([a.style("width", "30%")]),
+            //   h.col([a.style("width", "20%")]),
+            //   h.col([a.style("width", "20%")]),
+            //   h.col([a.style("width", "17%")]),
+            //   h.col([a.style("width", "13%")]),
+            // ]),
+            h.thead([], [
+              h.tr([], [
+                th("package", False),
+                th("author", True),
+                th("links", False),
+                th("updated", True),
+                th("downloads", True),
+              ]),
+            ]),
+            ..list.map(search_results, fn(search_result) {
+              view_result(search_result, time_ago)
+            })
           ],
+        )
+    },
+    h.footer(
+      [
+        a.style("padding-top", "10px"),
+        a.style("padding-bottom", "10px"),
+      ],
+      [
+        h.text(
+          "This includes only Gleam packages that spark joy for me, i.e. not all packages are included. This package list is ",
         ),
-      ])
-    // }
-    _ -> element.none()
-  }
+        h.strong([], [h.text("not maintained by the Gleam team")]),
+        h.text(", it is not official or objective or anything. "),
+        link("https://packages.gleam.run", "packages.gleam.run"),
+        h.text(
+          " Is Gleam's official site for seeing all packages. Thanks also to ",
+        ),
+        link("https://hex.pm/", "hex.pm"),
+        h.text(" and "),
+        link("https://gloogle.run", "gloogle.run"),
+        h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
+        h.br([]),
+        h.text("See all packages ordered by: "),
+        btn("new", sql.all_pkgs_by_recent),
+        btn("popular", sql.all_pkgs_by_downloaded),
+        btn("big", sql.all_pkgs_by_big),
+        btn("small", sql.all_pkgs_by_small),
+      ],
+    ),
+  ])
 }
 
 fn view_result(
@@ -1008,14 +1040,16 @@ fn link(href: String, label: String) -> Element(msg) {
 }
 
 fn btn(text, premade_query) {
-  h.button(
-    [
-      event.on_click(UserClickedButton(premade_query)),
-      a.style("margin", "5px"),
-      a.style("padding", "5px 10px"),
-      a.style("color", "var(--text)"),
-      a.style("cursor", "pointer"),
-    ],
-    [h.text(text)],
-  )
+  h.button([event.on_click(UserClickedButton(premade_query)), ..btn_styles()], [
+    h.text(text),
+  ])
+}
+
+fn btn_styles() {
+  [
+    a.style("margin", "5px"),
+    a.style("padding", "5px 10px"),
+    a.style("color", "var(--text)"),
+    a.style("cursor", "pointer"),
+  ]
 }
