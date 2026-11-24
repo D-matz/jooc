@@ -17,3 +17,6 @@ jobs:
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+# settings -> secrets and variables -> actions -> repository secrets
+# https://github.com/D-matz/jooc/settings/secrets/actions 
