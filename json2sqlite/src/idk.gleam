@@ -78,21 +78,21 @@ pub fn main() -> Nil {
             |> json.to_string
             |> bit_array.from_string
 
-          upload(credentials, "good.json", good_json)
+          upload(credentials, "good.json", good_json, "application/json")
           list.each(packages, process)
         }
         Error(message) -> io.println("Error: " <> message)
       }
       let assert Ok(data) = simplifile.read_bits(db_path)
         as "Cannot read the db"
-      upload(credentials, "packages.sqlite", data)
+      upload(credentials, "packages.sqlite", data, "application/vnd.sqlite3")
       io.println("Uploaded " <> db_path)
     }
     _ -> io.println("Usage: gleam run ACCESS_KEY_ID,SECRET_ACCESS_KEY")
   }
 }
 
-fn upload(credentials: String, key: String, data: BitArray) -> Nil {
+fn upload(credentials: String, key: String, data: BitArray, content_type: String) -> Nil {
   let assert Ok(#(access_key_id, secret_access_key)) =
     string.split_once(credentials, ",")
     as "Use the format ACCESS_KEY_ID,SECRET_ACCESS_KEY"
@@ -108,6 +108,8 @@ fn upload(credentials: String, key: String, data: BitArray) -> Nil {
   let request =
     put_object.request(bucket: "pkglist", key: key, body: data)
     |> put_object.build(creds)
+    |> request.set_header("content-type", content_type)
+
 
   let assert Ok(response) = httpc.send_bits(request)
     as "Cannot send the request"
