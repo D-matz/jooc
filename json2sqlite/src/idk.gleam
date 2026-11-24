@@ -21,7 +21,7 @@ import gleam/int
 import gleam/io
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/package_interface
 import gleam/result
 import gleam/string
@@ -123,21 +123,24 @@ fn upload(
 // An error in one package does not stop the others.
 fn process(package: storage.Package) -> Nil {
   case update(package) {
-    Ok(message) -> io.println(message)
+    Ok(Some(message)) -> io.println(message)
+    Ok(None) -> Nil
     Error(message) -> io.println("Error: " <> package.name <> ": " <> message)
   }
 }
 
-fn update(package: storage.Package) -> Result(String, String) {
+fn update(package: storage.Package) -> Result(Option(String), String) {
   let label = package.name <> " " <> package.latest_version
   use current <- result.try(
     is_current(package) |> result.map_error(string.inspect),
   )
   case current {
-    True -> Ok("Skipped " <> label <> ": already up to date")
+    True -> Ok(None)
     False -> {
       use count <- result.try(add_package(package))
-      Ok("Added " <> int.to_string(count) <> " definition(s) for " <> label)
+      Ok(Some(
+        "Added " <> int.to_string(count) <> " definition(s) for " <> label,
+      ))
     }
   }
 }
