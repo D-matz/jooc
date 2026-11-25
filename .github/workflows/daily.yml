@@ -15,6 +15,7 @@ jobs:
           gleam-version: "1.19.2"
           rebar3-version: "3"
       - run: gleam run -- "$R2_ACCESS_KEY_ID,$R2_SECRET_ACCESS_KEY"
+        working-directory: json2sqlite
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
