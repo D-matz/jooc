@@ -1,10 +1,7 @@
 //// Download the first "good" Hex package from already_read.json and add its
 //// modules and the canonical forms of their types and functions to a SQLite db.
 ////
-//// Create the db first: sqlite3 packages.db < schema.sql
-//// Dependencies: gleam_stdlib, glance, girard, gleam_json,
-////               gleam_package_interface, gleam_http, gleam_httpc, gleam_time,
-////               star, sqlight
+//// Create the db first: sqlite3 packages.sqlite < schema.sql
 
 import argv
 import bucket
@@ -70,22 +67,29 @@ fn unix_seconds(time: Timestamp) -> Int {
 pub fn main() -> Nil {
   case argv.load().arguments {
     [credentials] -> {
-      case all_packages() {
-        Ok(packages) -> {
-          let good_json =
-            json.array(packages, storage.package_to_json)
-            |> json.to_string
-            |> bit_array.from_string
+      let assert Ok(req) =
+        request.to("https://bucket.correctarity.com/packages.sqlite")
+        as "cannot parse url"
+      let assert Ok(resp) = httpc.send_bits(request.set_body(req, <<>>))
+        as "cannot get db"
+      let assert 200 = resp.status as "download ok"
+      let assert Ok(Nil) = simplifile.write_bits(db_path, resp.body)
+        as "cannot write db"
 
-          upload(credentials, "good.json", good_json, "application/json")
-          list.each(packages, process)
-        }
-        Error(message) -> io.println("Error: " <> message)
-      }
+      let assert Ok(packages) = all_packages() as "error getting packages"
+
+      let good_json =
+        json.array(packages, storage.package_to_json)
+        |> json.to_string
+        |> bit_array.from_string
+
+      upload(credentials, "good.json", good_json, "application/json")
+      list.each(packages, process)
+
+
       let assert Ok(data) = simplifile.read_bits(db_path)
-        as "Cannot read the db"
       upload(credentials, "packages.sqlite", data, "application/vnd.sqlite3")
-      io.println("Uploaded " <> db_path)
+      io.println("Uploaded packages.sqlite")
     }
     _ -> io.println("Usage: gleam run ACCESS_KEY_ID,SECRET_ACCESS_KEY")
   }
