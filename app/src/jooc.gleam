@@ -44,7 +44,6 @@ type Model {
     lucy: Search,
     all_pkg_names: List(String),
     search_text: String,
-    query_from_initial_uri: Option(String),
   )
 }
 
@@ -58,7 +57,7 @@ type ModuleSnippet {
 
 type Snippet {
   FuzzyMatch(before: String, match: String, after: String)
-  Canonical(definitions: List(String))
+  Definitions(definitions: List(String))
 }
 
 type Db {
@@ -110,7 +109,6 @@ fn init(_) -> #(Model, Effect(Msg)) {
       NotSearching,
       [],
       option.unwrap(query_from_initial_uri, ""),
-      query_from_initial_uri,
     ),
     sqlite.check_cached_etag(CacheReturnedEtag),
   )
@@ -129,7 +127,7 @@ type Msg {
   ServerReturnedLoadProgress(Float)
   SqliteReturnedOpen(Result(sqlite.Database, String))
   SqliteReturnedQuery(
-    query_was: Query,
+    query_was: SqliteQuery,
     search_text_was: String,
     got: Result(Dynamic, String),
   )
@@ -137,9 +135,14 @@ type Msg {
   UserClickedButton(String)
 }
 
-type Query {
-  QueryFuzzy
-  QueryCanonical
+type SqliteQuery {
+  Names
+  Query(SqliteSearch)
+}
+
+type SqliteSearch {
+  Canonical
+  Fuzzy
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -223,15 +226,8 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               database: DbLoaded(Metadata(db: resp, loading_percent: None)),
               all_pkg_names:,
             )
-          let search_result = case model.query_from_initial_uri {
-            Some(text) -> search_metadata(resp, text)
-            None -> search_metadata(resp, "")
-          }
-          // if we initially load json metadata, just do initial uri query in that
-          // and dont run uri query again after user clicks to load sqlite db
-          let model =
-            Model(..model, search_result:, query_from_initial_uri: None)
-
+          let search_result = search_metadata(resp, model.search_text)
+          let model = Model(..model, search_result:)
           #(model, effect.none())
         }
         Error(err) -> {
@@ -250,33 +246,51 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     SqliteReturnedOpen(Error(_)) -> panic as "db open failed xdd"
     SqliteReturnedOpen(Ok(db)) -> {
-      let get_all_pkg_names =
-        sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
-          QueryCanonical,
-          model.search_text,
-          _,
-        ))
       let model = Model(..model, database: DbLoaded(Code(db)))
-      #(model, get_all_pkg_names)
+      case model.all_pkg_names {
+        [] -> {
+          let get_all_pkg_names =
+            sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
+              Names,
+              model.search_text,
+              _,
+            ))
+          #(model, get_all_pkg_names)
+        }
+        _ -> text_to_query(model.search_text, model)
+      }
     }
-    SqliteReturnedQuery(query_was, search_text_was, got) -> {
+
+    SqliteReturnedQuery(Names, _, got) -> {
+      let all_pkg_names = case got {
+        Ok(rows) ->
+          case decode.run(rows, decode.list(canonical_result_decoder())) {
+            Ok(rows) ->
+              rows |> result.values |> list.map(fn(p) { p.package.name })
+            Error(_) -> []
+          }
+        Error(_) -> []
+      }
+      text_to_query(model.search_text, Model(..model, all_pkg_names:))
+    }
+    SqliteReturnedQuery(Query(query_was), search_text_was, got) ->
       case search_text_was == model.search_text {
         False -> #(model, effect.none())
         True -> {
           let decoder = case query_was {
-            QueryFuzzy -> decode.list(search_result_decoder(search_text_was))
-            QueryCanonical -> decode.list(canonical_result_decoder())
+            Fuzzy -> decode.list(search_result_decoder(search_text_was))
+            Canonical -> decode.list(canonical_result_decoder())
           }
           handle_query_result(model, got, decoder)
         }
       }
-    }
+
     UserTypedQuery(text) -> text_to_query(text, model)
     UserClickedButton(premade_query) -> {
       let exec = case model.database {
         DbLoaded(Code(db)) -> {
           sqlite.query(db, premade_query, [], SqliteReturnedQuery(
-            QueryFuzzy,
+            Query(Fuzzy),
             "",
             _,
           ))
@@ -304,7 +318,7 @@ fn handle_query_result(
   query_result: Result(Dynamic, String),
   decoder: decode.Decoder(List(Result(SearchResult, Nil))),
 ) -> #(Model, Effect(Msg)) {
-  let query_resp =
+  let search_result =
     case query_result {
       Ok(query_resp) ->
         case decode.run(query_resp, decoder) {
@@ -321,35 +335,7 @@ fn handle_query_result(
     }
     |> result.values
     |> merge_modules_by_package
-  // the first time we run this will be empty and on loading it gets all packages
-  // so we fill out name list so we can do levenshtein edit distance on package names in gleam
-  // as fts5 trigrams doesnt seem great for eg luster -> lustre
-  // also first time we get response, run user's initial query from url...
-  // can't just run it immediately because we need to load package names first here
-
-  // if you immediately load sqlite, do need to get all pkgs
-  // if you go from json loaded -> sqlite, dont need to do this
-  // the pkg name list kind of doing double duty
-  // to indicate if we have done an initial query from uri yet, confusing
-
-  case model.all_pkg_names {
-    [] -> {
-      let all_pkg_names = list.map(query_resp, fn(pkg) { pkg.package.name })
-      let model = Model(..model, all_pkg_names:)
-      case model.query_from_initial_uri {
-        Some(text) -> text_to_query(text, model)
-        None -> {
-          let model =
-            Model(..model, search_result: query_resp, lucy: NotSearching)
-          #(model, effect.none())
-        }
-      }
-    }
-    _ -> {
-      let model = Model(..model, search_result: query_resp, lucy: NotSearching)
-      #(model, effect.none())
-    }
-  }
+  #(Model(..model, search_result:, lucy: NotSearching), effect.none())
 }
 
 fn open_db(model: Model, sqlite_db: BitArray) -> #(Model, Effect(Msg)) {
@@ -401,7 +387,7 @@ fn text_to_query(text, model) {
       let exec = case chars {
         [] ->
           sqlite.query(db, sql.all_pkgs_by_recent, [], SqliteReturnedQuery(
-            QueryFuzzy,
+            Query(Fuzzy),
             model.search_text,
             _,
           ))
@@ -410,13 +396,13 @@ fn text_to_query(text, model) {
             db,
             sql.info_only,
             [text, text, text],
-            SqliteReturnedQuery(QueryFuzzy, model.search_text, _),
+            SqliteReturnedQuery(Query(Fuzzy), model.search_text, _),
           )
         [_, _, ..] -> {
           case parse_type_or_fn(chars) {
             Ok(canonical) ->
               sqlite.query(db, sql.canonical, [canonical], SqliteReturnedQuery(
-                QueryCanonical,
+                Query(Canonical),
                 model.search_text,
                 _,
               ))
@@ -436,7 +422,7 @@ fn text_to_query(text, model) {
                     |> json.to_string,
                   bm25_threshold,
                 ],
-                SqliteReturnedQuery(QueryFuzzy, model.search_text, _),
+                SqliteReturnedQuery(Query(Fuzzy), model.search_text, _),
               )
             }
           }
@@ -649,7 +635,7 @@ fn canonical_result_decoder() -> decode.Decoder(Result(SearchResult, Nil)) {
     )
   let snippet = case module_name, code {
     Some(module_name), Some(code) -> [
-      ModuleSnippet(module_name, Canonical([code])),
+      ModuleSnippet(module_name, Definitions([code])),
     ]
     _, _ -> []
   }
@@ -706,7 +692,7 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
       ]),
     ],
     [
-      h.p([a.style("height", "1.5rem")], case pkg_db {
+      h.p([a.style("height", "3.5rem")], case pkg_db {
         Metadata(_, loading_percent:) ->
           case loading_percent {
             Some(percent) -> {
@@ -724,7 +710,7 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
                 [event.on_click(UserClickedDownloadCode), ..btn_styles()],
                 [
                   h.text(
-                    "enable search by code text and type/fn (will download 150MB and search in browser)",
+                    "enable search type/fn and fuzzy code text (downloads 150MB for in-browser search)",
                   ),
                 ],
               ),
@@ -975,7 +961,7 @@ fn code_snippet(snippet: ModuleSnippet) -> Element(msg) {
             h.text(after),
           ]),
         ]
-        Canonical(definitions:) ->
+        Definitions(definitions:) ->
           list.map(definitions, fn(source) { code_block([h.text(source)]) })
       }
     ],
