@@ -16,6 +16,7 @@ import gleam/result
 import gleam/string
 import gleam/time/timestamp
 import gleam/uri
+import localstorage
 import lustre
 import lustre/attribute as a
 import lustre/effect.{type Effect}
@@ -44,6 +45,7 @@ type Model {
     lucy: Search,
     all_pkg_names: List(String),
     search_text: String,
+    auto_download_sqlite: Bool
   )
 }
 
@@ -109,6 +111,7 @@ fn init(_) -> #(Model, Effect(Msg)) {
       NotSearching,
       [],
       option.unwrap(query_from_initial_uri, ""),
+      localstorage.get_autodownload(),
     ),
     sqlite.check_cached_etag(CacheReturnedEtag),
   )
@@ -133,6 +136,7 @@ type Msg {
   )
   UserTypedQuery(String)
   UserClickedButton(String)
+  UserCheckedAutomaticallyDownloadSqlite(Bool)
 }
 
 type SqliteQuery {
@@ -143,6 +147,11 @@ type SqliteQuery {
 type SqliteSearch {
   Canonical
   Fuzzy
+}
+
+type AutomaticallyDownloadSqlite {
+  AutomaticallyDownload
+  DoNotDownloadUnlessClicked
 }
 
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
@@ -228,7 +237,11 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
           let search_result = search_metadata(resp, model.search_text)
           let model = Model(..model, search_result:)
-          #(model, effect.none())
+
+          case localstorage.get_autodownload() {
+            True -> download_server_db(model)
+            False -> #(model, effect.none())
+          }
         }
         Error(err) -> {
           echo err
@@ -310,6 +323,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
         _ -> #(model, effect.none())
       }
+    UserCheckedAutomaticallyDownloadSqlite(auto_download_sqlite) -> {
+      let model = Model(..model, auto_download_sqlite:)
+      let save_pref =
+        effect.from(fn(_) { localstorage.set_autodownload(auto_download_sqlite) })
+      #(model, save_pref)
+    }
   }
 }
 
@@ -692,7 +711,7 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
       ]),
     ],
     [
-      h.p([a.style("height", "3.5rem")], case pkg_db {
+      h.p([a.style("height", "8rem")], case pkg_db {
         Metadata(_, loading_percent:) ->
           case loading_percent {
             Some(percent) -> {
@@ -716,7 +735,34 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
               ),
             ]
           }
-        Code(_) -> [h.text("code search enabled")]
+        Code(_) -> [
+          h.text("code search enabled, for example:"),
+          h.ul(
+            [a.style("margin", "0")],
+            list.map(
+              [
+                "type Wibble{Wobble(Int) Woo}",
+                "fn idk(x: String) -> Int",
+                "helo world",
+              ],
+              fn(search_text) {
+                h.li([], [
+                  h.button([event.on_click(UserTypedQuery(search_text))], [
+                    h.text(search_text),
+                  ]),
+                ])
+              },
+            ),
+          ),
+          h.label([], [
+            h.text("if new packages available, automatically download to device"),
+            h.input([
+              a.type_("checkbox"),
+              a.checked(model.auto_download_sqlite),
+              event.on_check(UserCheckedAutomaticallyDownloadSqlite),
+            ]),
+          ]),
+        ]
       }),
       h.div(
         [
