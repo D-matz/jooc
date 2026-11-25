@@ -45,7 +45,7 @@ type Model {
     lucy: Search,
     all_pkg_names: List(String),
     search_text: String,
-    auto_download_sqlite: Bool
+    auto_download_sqlite: Bool,
   )
 }
 
@@ -326,7 +326,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     UserCheckedAutomaticallyDownloadSqlite(auto_download_sqlite) -> {
       let model = Model(..model, auto_download_sqlite:)
       let save_pref =
-        effect.from(fn(_) { localstorage.set_autodownload(auto_download_sqlite) })
+        effect.from(fn(_) {
+          localstorage.set_autodownload(auto_download_sqlite)
+        })
       #(model, save_pref)
     }
   }
@@ -726,11 +728,20 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
             }
             None -> [
               h.button(
-                [event.on_click(UserClickedDownloadCode), ..btn_styles()],
                 [
-                  h.text(
-                    "enable search type/fn and fuzzy code text (downloads 150MB for in-browser search)",
-                  ),
+                  pressable(),
+                  event.on_click(UserClickedDownloadCode),
+                  a.style("font-size", "1rem"),
+                  ..btn_styles()
+                ],
+                [
+                  h.text("enable search on type/fn"),
+                  h.br([]),
+                  h.text("and on fuzzy code text"),
+                  h.br([]),
+                  h.text("(downloads 150MB for"),
+                  h.br([]),
+                  h.text("in-browser search)"),
                 ],
               ),
             ]
@@ -747,15 +758,20 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
               ],
               fn(search_text) {
                 h.li([], [
-                  h.button([event.on_click(UserTypedQuery(search_text))], [
-                    h.text(search_text),
-                  ]),
+                  h.button(
+                    [pressable(), event.on_click(UserTypedQuery(search_text))],
+                    [
+                      h.text(search_text),
+                    ],
+                  ),
                 ])
               },
             ),
           ),
           h.label([], [
-            h.text("if new packages available, automatically download to device"),
+            h.text(
+              "if new packages available, automatically download to device",
+            ),
             h.input([
               a.type_("checkbox"),
               a.checked(model.auto_download_sqlite),
@@ -801,6 +817,10 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
       view_results(model, timeago.new()),
     ],
   )
+}
+
+fn pressable() -> a.Attribute(Msg) {
+  a.class("pressable")
 }
 
 fn view_star(model: Model) -> Element(Msg) {
@@ -889,10 +909,12 @@ fn view_results(model: Model, time_ago) -> Element(Msg) {
         h.text(".  Gleam Lucy starfish mascot © 2026 Louis Pilfold."),
         h.br([]),
         h.text("See all packages ordered by: "),
-        btn("new", sql.all_pkgs_by_recent),
-        btn("popular", sql.all_pkgs_by_downloaded),
-        btn("big", sql.all_pkgs_by_big),
-        btn("small", sql.all_pkgs_by_small),
+        h.span([a.style("display", "inline-block")], [
+          btn("new", sql.all_pkgs_by_recent),
+          btn("popular", sql.all_pkgs_by_downloaded),
+          btn("big", sql.all_pkgs_by_big),
+          btn("small", sql.all_pkgs_by_small),
+        ]),
       ],
     ),
   ])
@@ -1072,9 +1094,16 @@ fn link(href: String, label: String) -> Element(msg) {
 }
 
 fn btn(text, premade_query) {
-  h.button([event.on_click(UserClickedButton(premade_query)), ..btn_styles()], [
-    h.text(text),
-  ])
+  h.button(
+    [
+      pressable(),
+      event.on_click(UserClickedButton(premade_query)),
+      ..btn_styles()
+    ],
+    [
+      h.text(text),
+    ],
+  )
 }
 
 fn btn_styles() {
