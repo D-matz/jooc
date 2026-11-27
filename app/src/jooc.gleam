@@ -809,7 +809,6 @@ fn main_view(model: Model, pkg_db: PkgDb) -> Element(Msg) {
               #("border", "1px solid #3a3a3a"),
               #("border-radius", "1.75rem"),
               #("background", "var(--bg)"),
-              #("color", "var(--text)"),
             ]),
           ]),
         ],
@@ -1110,7 +1109,6 @@ fn btn_styles() {
   [
     a.style("margin", "5px"),
     a.style("padding", "5px 10px"),
-    a.style("color", "var(--text)"),
     a.style("cursor", "pointer"),
   ]
 }
